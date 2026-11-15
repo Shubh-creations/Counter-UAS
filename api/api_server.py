@@ -1,49 +1,269 @@
 """
-CUAS v6.0-MONOLITH — Anduril Lattice Mission Autonomy & Swarm Orchestration Operating System.
-Features:
-- 100% Achromatic Monochrome Tactical UI (#000000 to #FFFFFF, zero color anywhere).
-- Three-Phase Mission Lifecycle:
-  [1] PRE-MISSION MODEL: Wargaming, Monte Carlo defense simulation, parameter sizing.
-  [2] LIVE EXECUTION: Full-Bleed 100vw x 100vh 3D Spatial Battlespace, 20 Hz WebSocket telemetry.
-  [3] POST-MISSION DEBRIEF: 3,600-frame timeline scrubber (0.5x to 4x), Mission KPI Summary.
-- Human-on-the-Loop (HOTL) Mission Autonomy Playbook:
-  PLAY_01_PERIMETER_CAP, PLAY_02_SWARM_EW_BARRIER, PLAY_03_KINETIC_WOLF_PACK, PLAY_04_CEASEFIRE_RTB.
-- Friendly Collaborative Swarm Assets (ISR-WINGMAN-01..02, ANVIL-ICP-01..04).
-- Real-Time CUDA Acceleration Telemetry (NVIDIA RTX 3050, VRAM usage, kernel latency).
-- Cryptographic SHA-256 Forensic Audit Ledger.
+CUAS v6.0-MONOLITH — CUDA-Accelerated Anduril Lattice Mission Autonomy C2
+100% Monochrome Black-and-White Tactical Operating Picture
+Drop-in replacement for C:\\CUAS\\api\\api_server.py
 """
 
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import json
 import math
 import random
 import time
+from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Deque, Dict, List, Optional
 
+import numpy as np
 import uvicorn
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 
-from utils.cuda_runtime import get_cuda_engine
+try:
+    import torch
+
+    TORCH_AVAILABLE = True
+except ImportError:
+    torch = None  # type: ignore
+    TORCH_AVAILABLE = False
+
 
 # ============================================================================
-# 1. CRYPTOGRAPHIC SHA-256 FORENSIC AUDIT LEDGER
+# 1. CUDA GPU COMPUTE & SIGNAL PROCESSING ENGINE
+# ============================================================================
+
+
+class CudaTacticalComputeEngine:
+    """
+    Executes batched 3D swarm kinematics, torch.stft micro-Doppler blade-flash
+    spectrograms, and torch.fft SDR spectrum waterfalls on NVIDIA CUDA GPU.
+    """
+
+    def __init__(self) -> None:
+        self.cuda_enabled = bool(TORCH_AVAILABLE and torch.cuda.is_available())
+        if self.cuda_enabled:
+            self.device = torch.device("cuda:0")
+            torch.backends.cudnn.benchmark = True
+            self.device_name = torch.cuda.get_device_name(0)
+        elif TORCH_AVAILABLE:
+            self.device = torch.device("cpu")
+            self.device_name = "CPU_FALLBACK_TENSOR"
+        else:
+            self.device = None
+            self.device_name = "NUMPY_FALLBACK"
+
+        self.last_kernel_ms = 0.0
+        self._warmup()
+
+    def _warmup(self) -> None:
+        if not TORCH_AVAILABLE:
+            return
+        try:
+            with torch.no_grad():
+                dummy = torch.randn((16, 9), device=self.device, dtype=torch.float32)
+                _ = torch.linalg.norm(dummy, dim=1)
+                if self.cuda_enabled:
+                    torch.cuda.synchronize()
+        except Exception:
+            pass
+
+    def get_hardware_telemetry(self) -> Dict[str, Any]:
+        if self.cuda_enabled:
+            alloc_mb = round(torch.cuda.memory_allocated(0) / (1024 * 1024), 1)
+            res_mb = round(torch.cuda.memory_reserved(0) / (1024 * 1024), 1)
+            total_mb = round(
+                torch.cuda.get_device_properties(0).total_memory / (1024 * 1024), 0
+            )
+            return {
+                "backend": "CUDA_FP16_ACTIVE",
+                "device_name": self.device_name,
+                "vram_allocated_mb": alloc_mb,
+                "vram_reserved_mb": res_mb,
+                "vram_total_mb": int(total_mb),
+                "kernel_latency_ms": round(self.last_kernel_ms, 2),
+            }
+        return {
+            "backend": self.device_name,
+            "device_name": self.device_name,
+            "vram_allocated_mb": 0.0,
+            "vram_reserved_mb": 0.0,
+            "vram_total_mb": 0,
+            "kernel_latency_ms": round(self.last_kernel_ms, 2),
+        }
+
+    def compute_batched_ukf_predictions(
+        self,
+        positions: List[List[float]],
+        velocities: List[List[float]],
+        accelerations: List[List[float]],
+        horizon_steps: int = 24,
+        dt: float = 0.4,
+    ) -> Dict[str, Any]:
+        """
+        Vectorized GPU 3D IMM-UKF trajectory rollout & kinematic risk metrics
+        across all N simultaneous swarm assets in a single tensor kernel pass.
+        """
+        n = len(positions)
+        if n == 0:
+            return {"trajectories": [], "ranges": [], "closing_vels": [], "imm_dive": []}
+
+        t0 = time.perf_counter()
+        if self.cuda_enabled:
+            start_evt = torch.cuda.Event(enable_timing=True)
+            end_evt = torch.cuda.Event(enable_timing=True)
+            start_evt.record()
+
+        if TORCH_AVAILABLE:
+            with torch.no_grad():
+                pos = torch.tensor(positions, device=self.device, dtype=torch.float32)  # [N, 3]
+                vel = torch.tensor(velocities, device=self.device, dtype=torch.float32)  # [N, 3]
+                acc = torch.tensor(accelerations, device=self.device, dtype=torch.float32)  # [N, 3]
+
+                # Ground 2D range and 3D slant range
+                range_2d = torch.linalg.norm(pos[:, :2], dim=1)
+                slant_range = torch.linalg.norm(pos, dim=1).clamp(min=1.0)
+
+                # Radial closing velocity toward Base HQ (0,0,0)
+                closing_vel = -torch.sum(pos * vel, dim=1) / slant_range
+
+                # IMM Terminal Ballistic Dive Probability
+                dive_raw = torch.clamp(-vel[:, 2] / 14.0, min=0.0) + torch.where(
+                    (range_2d < 750.0) & (closing_vel > 18.0),
+                    torch.tensor(0.85, device=self.device),
+                    torch.tensor(0.10, device=self.device),
+                )
+                evasive_raw = torch.clamp(torch.linalg.norm(acc[:, :2], dim=1) / 10.0, max=1.0)
+                loiter_raw = torch.clamp(1.0 - torch.maximum(dive_raw, evasive_raw) * 0.75, min=0.08)
+                imm_dive = dive_raw / (dive_raw + evasive_raw + loiter_raw + 1e-6)
+
+                # Batched 3D future rollout [N, H, 3]
+                steps = torch.arange(1, horizon_steps + 1, device=self.device, dtype=torch.float32) * dt
+                steps_col = steps.view(1, horizon_steps, 1)  # [1, H, 1]
+                traj = (
+                    pos.unsqueeze(1)
+                    + vel.unsqueeze(1) * steps_col
+                    + 0.5 * acc.unsqueeze(1) * (steps_col ** 2)
+                )
+                traj[:, :, 2] = torch.clamp(traj[:, :, 2], min=0.0)
+
+                if self.cuda_enabled:
+                    end_evt.record()
+                    torch.cuda.synchronize()
+                    self.last_kernel_ms = float(start_evt.elapsed_time(end_evt))
+                else:
+                    self.last_kernel_ms = (time.perf_counter() - t0) * 1000.0
+
+                return {
+                    "trajectories": torch.round(traj, decimals=1).cpu().tolist(),
+                    "ranges": torch.round(range_2d, decimals=1).cpu().tolist(),
+                    "closing_vels": torch.round(closing_vel, decimals=1).cpu().tolist(),
+                    "imm_dive": torch.round(imm_dive, decimals=2).cpu().tolist(),
+                }
+
+        # Pure NumPy fallback if PyTorch is absent
+        pos_np = np.array(positions, dtype=np.float32)
+        vel_np = np.array(velocities, dtype=np.float32)
+        acc_np = np.array(accelerations, dtype=np.float32)
+        ranges = np.linalg.norm(pos_np[:, :2], axis=1)
+        slant = np.maximum(np.linalg.norm(pos_np, axis=1), 1.0)
+        closing = -np.sum(pos_np * vel_np, axis=1) / slant
+        steps_np = (np.arange(1, horizon_steps + 1, dtype=np.float32) * dt)[None, :, None]
+        traj_np = pos_np[:, None, :] + vel_np[:, None, :] * steps_np + 0.5 * acc_np[:, None, :] * (steps_np ** 2)
+        traj_np[:, :, 2] = np.maximum(traj_np[:, :, 2], 0.0)
+        self.last_kernel_ms = (time.perf_counter() - t0) * 1000.0
+        return {
+            "trajectories": np.round(traj_np, 1).tolist(),
+            "ranges": np.round(ranges, 1).tolist(),
+            "closing_vels": np.round(closing, 1).tolist(),
+            "imm_dive": [0.65] * n,
+        }
+
+    def compute_cuda_micro_doppler(
+        self, rotor_rpm: float, closing_vel: float, phase_t: float
+    ) -> List[List[float]]:
+        """
+        Synthesizes complex pulse-Doppler radar returns on GPU and runs torch.stft
+        to produce a 32x24 normalized luminance matrix (0.0 to 1.0) for rotor
+        blade-flash micro-Doppler visualization.
+        """
+        if TORCH_AVAILABLE:
+            try:
+                with torch.no_grad():
+                    fs = 1024.0
+                    t = torch.linspace(0, 0.5, 512, device=self.device, dtype=torch.float32) + phase_t
+                    body_freq = min(260.0, abs(closing_vel) * 4.5 + 35.0)
+                    blade_freq = min(290.0, (rotor_rpm / 60.0) * 2.0)
+
+                    # Main fuselage Doppler + asymmetric rotor blade-flash FM sidebands
+                    sig = 0.75 * torch.sin(2.0 * math.pi * body_freq * t)
+                    for h in (1.0, 1.5, 2.0):
+                        mod = 0.45 * torch.sin(2.0 * math.pi * (blade_freq * h) * t + 1.8 * torch.sin(14.0 * t))
+                        sig = sig + mod
+                    sig = sig + 0.14 * torch.randn_like(sig)
+
+                    window = torch.hann_window(64, device=self.device)
+                    stft_mag = torch.stft(
+                        sig, n_fft=64, hop_length=20, window=window, return_complex=True
+                    ).abs()  # [33, 26]
+                    stft_slice = stft_mag[:32, :24]
+                    stft_norm = stft_slice / (stft_slice.max() + 1e-6)
+                    return torch.round(stft_norm, decimals=2).cpu().tolist()
+            except Exception:
+                pass
+
+        # Fallback matrix
+        rows = []
+        for f in range(32):
+            row = [
+                round(abs(math.sin(f * 0.25 + c * 0.35 + phase_t * 4.0)) * 0.85, 2)
+                for c in range(24)
+            ]
+            rows.append(row)
+        return rows
+
+    def compute_cuda_rf_fft(
+        self, is_rf_silent: bool, is_jammed: bool, phase_t: float
+    ) -> List[float]:
+        """Computes 48-bin normalized SDR power spectral density via torch.fft.rfft on GPU."""
+        if TORCH_AVAILABLE:
+            try:
+                with torch.no_grad():
+                    t = torch.linspace(0, 1.0, 128, device=self.device, dtype=torch.float32) + phase_t
+                    noise = 0.18 * torch.randn_like(t)
+                    if is_jammed:
+                        # High-power barrage jamming across 2.4/5.8 GHz bins
+                        sig = noise + 1.6 * torch.sin(2 * math.pi * 18 * t) + 1.5 * torch.cos(2 * math.pi * 34 * t)
+                    elif is_rf_silent:
+                        sig = noise * 0.65
+                    else:
+                        hop = 14.0 + 6.0 * math.sin(phase_t * 3.0)
+                        sig = noise + 1.15 * torch.sin(2 * math.pi * hop * t) + 0.95 * torch.sin(2 * math.pi * 38.0 * t)
+                    fft_mag = torch.fft.rfft(sig).abs()[:48]
+                    fft_norm = torch.clamp(fft_mag / 45.0, 0.05, 1.0)
+                    return torch.round(fft_norm, decimals=2).cpu().tolist()
+            except Exception:
+                pass
+
+        return [round(0.15 + random.random() * 0.2, 2) for _ in range(48)]
+
+
+# ============================================================================
+# 2. CRYPTOGRAPHIC SHA-256 FORENSIC AUDIT LEDGER
 # ============================================================================
 
 AUDIT_LOG_PATH = Path("logs/audit/mission_audit_chain.jsonl")
 
 
 class LatticeAuditLedger:
-    """Tamper-evident SHA-256 hash-chained mission logger."""
+    """Tamper-evident SHA-256 hash-chained mission ledger."""
 
     def __init__(self, log_path: Path = AUDIT_LOG_PATH) -> None:
         self.log_path = log_path
@@ -63,9 +283,9 @@ class LatticeAuditLedger:
                 self.chain = []
         if not self.chain:
             self.record_event(
-                event_type="MONOLITH_OS_BOOT",
-                operator="AUTONOMOUS_CORE",
-                payload={"version": "6.0.0-MONOLITH", "posture": "ACTIVE_DEFENSE", "cuda": True},
+                event_type="MONOLITH_CUDA_BOOT",
+                operator="LATTICE_AUTONOMY_OS",
+                payload={"version": "6.0.0-MONOLITH", "theme": "ACHROMATIC_TACTICAL"},
             )
 
     def record_event(
@@ -107,23 +327,18 @@ class LatticeAuditLedger:
 
 
 # ============================================================================
-# 2. 3D SWARM KINEMATICS, COLLABORATIVE ASSETS & MISSION LIFECYCLE ENGINE
+# 3. MISSION AUTONOMY ORCHESTRATOR & CLOSED-LOOP REPLAY ENGINE
 # ============================================================================
 
 BASE_LAT = 37.7749
 BASE_LON = -122.4194
 
 
-def enu_to_geodetic(east_m: float, north_m: float) -> Tuple[float, float]:
-    d_lat = north_m / 111132.954
-    d_lon = east_m / (111132.954 * math.cos(math.radians(BASE_LAT)))
-    return round(BASE_LAT + d_lat, 6), round(BASE_LON + d_lon, 6)
-
-
 @dataclass
-class TacticalTrack:
+class SwarmEntity:
     target_id: str
-    affiliation: str                           # "HOSTILE", "FRIENDLY", "CIVILIAN"
+    cluster_id: str
+    affiliation: str  # HOSTILE, SUSPECT, FRIENDLY_WINGMAN, FRIENDLY_INTERCEPTOR, NEUTRAL
     drone_class: str
     rf_protocol: str
     east_m: float
@@ -135,606 +350,551 @@ class TacticalTrack:
     ax_ms2: float = 0.0
     ay_ms2: float = 0.0
     az_ms2: float = 0.0
-    rcs_dbsm: float = -16.0
-    rotor_rpm: float = 18000.0
-    payload_detected: bool = False
-    confidence: float = 0.94
-    status: str = "ACTIVE"                     # "ACTIVE", "JAMMED", "SPOOFED", "DAZZLED", "INTERCEPTED", "SPLASH"
-    kill_chain_stage: str = "IDENTIFY"
+    rcs_dbsm: float = -15.8
+    rotor_rpm: float = 14400.0
+    payload_detected: bool = True
+    confidence: float = 0.962
     active_effectors: List[str] = field(default_factory=list)
+    status: str = "ACTIVE"
+    assigned_asset: str = "UNASSIGNED"
     trail: List[List[float]] = field(default_factory=list)
     intercept_target_id: Optional[str] = None
-    is_friendly: bool = False
-    callsign: str = ""
-
-    def compute_metrics(self) -> Dict[str, Any]:
-        range_2d = math.hypot(self.east_m, self.north_m)
-        slant_range = math.sqrt(self.east_m**2 + self.north_m**2 + self.alt_m**2)
-        bearing_deg = (math.degrees(math.atan2(self.east_m, self.north_m)) + 360.0) % 360.0
-        speed_ms = math.sqrt(self.vx_ms**2 + self.vy_ms**2 + self.vz_ms**2)
-
-        # Closing velocity along radial line
-        if range_2d > 1e-3:
-            closing_vel = -(self.east_m * self.vx_ms + self.north_m * self.vy_ms) / range_2d
-        else:
-            closing_vel = 0.0
-
-        tti_s = round(range_2d / closing_vel, 1) if closing_vel > 1.5 else None
-
-        # Geofence Zones
-        if range_2d <= 500.0:
-            zone = "RED // DEFENDED KILLZONE"
-            zone_code = "RED"
-        elif range_2d <= 1500.0:
-            zone = "AMBER // WARNING PERIMETER"
-            zone_code = "AMBER"
-        elif range_2d <= 3500.0:
-            zone = "CYAN // SURVEILLANCE"
-            zone_code = "CYAN"
-        else:
-            zone = "CLEAR // AIRSPACE SAFE"
-            zone_code = "CLEAR"
-
-        # IMM 3-Mode Filter Probabilities
-        is_diving = (self.vz_ms < -10.0 and closing_vel > 15.0)
-        is_turning = abs(self.ax_ms2) > 4.0 or abs(self.ay_ms2) > 4.0
-        if is_diving:
-            imm_modes = {"CV": 0.06, "CTRV": 0.12, "CA_DIVE": 0.82}
-            dominant_mode = "CA_DIVE"
-        elif is_turning:
-            imm_modes = {"CV": 0.18, "CTRV": 0.72, "CA_DIVE": 0.10}
-            dominant_mode = "CTRV"
-        else:
-            imm_modes = {"CV": 0.78, "CTRV": 0.16, "CA_DIVE": 0.06}
-            dominant_mode = "CV"
-
-        # Numerical Threat Severity Score (0-100)
-        if self.affiliation == "FRIENDLY":
-            threat_score = 0.0
-            sub_scores = {"proximity": 0.0, "closing_rate": 0.0, "payload": 0.0, "rf_silence": 0.0}
-        else:
-            prox_score = max(0.0, min(35.0, (1.0 - range_2d / 3500.0) * 35.0))
-            closing_score = max(0.0, min(25.0, (closing_vel / 35.0) * 25.0))
-            dive_score = 20.0 if dominant_mode == "CA_DIVE" else 0.0
-            payload_score = 15.0 if self.payload_detected else 0.0
-            rf_silent_penalty = 10.0 if self.rf_protocol == "RF_SILENT_AUTONOMOUS" else 0.0
-            threat_score = round(min(100.0, prox_score + closing_score + dive_score + payload_score + rf_silent_penalty), 1)
-            sub_scores = {
-                "proximity": round(prox_score, 1),
-                "closing_rate": round(closing_score, 1),
-                "payload": round(payload_score, 1),
-                "rf_silence": round(rf_silent_penalty, 1),
-            }
-
-        # Kill-chain stage progression
-        if self.status in ("JAMMED", "SPOOFED", "DAZZLED", "INTERCEPTING"):
-            stage_num = 5
-            self.kill_chain_stage = "ENGAGE"
-        elif threat_score >= 70.0:
-            stage_num = 4
-            self.kill_chain_stage = "CUE_EFFECTOR"
-        elif threat_score >= 40.0:
-            stage_num = 3
-            self.kill_chain_stage = "IDENTIFY"
-        else:
-            stage_num = 2
-            self.kill_chain_stage = "TRACK"
-
-        # Recommended WTA Countermeasure
-        if self.affiliation == "FRIENDLY":
-            wta_rec = "NONE"
-            p_success = 1.0
-        elif self.rf_protocol == "RF_SILENT_AUTONOMOUS":
-            wta_rec = "KINETIC_INTERCEPTOR" if range_2d < 1800.0 else "OPTICAL_DAZZLER"
-            p_success = 0.94 if range_2d < 1800.0 else 0.78
-        elif dominant_mode == "CA_DIVE" or range_2d <= 800.0:
-            wta_rec = "KINETIC_INTERCEPTOR"
-            p_success = 0.96
-        elif range_2d <= 1500.0:
-            wta_rec = "RF_JAMMER"
-            p_success = 0.89
-        elif range_2d <= 2500.0:
-            wta_rec = "GNSS_SPOOFER"
-            p_success = 0.84
-        else:
-            wta_rec = "OPTICAL_DAZZLER"
-            p_success = 0.74
-
-        # Predicted 3D Trajectory Tube (10 steps)
-        predicted_path = []
-        cur_e, cur_n, cur_u = self.east_m, self.north_m, self.alt_m
-        dt_p = 0.4
-        for step in range(1, 11):
-            cur_e += self.vx_ms * dt_p + 0.5 * self.ax_ms2 * (dt_p**2)
-            cur_n += self.vy_ms * dt_p + 0.5 * self.ay_ms2 * (dt_p**2)
-            cur_u += self.vz_ms * dt_p + 0.5 * self.az_ms2 * (dt_p**2)
-            cur_u = max(0.0, cur_u)
-            cep_radius = round(1.5 + step * 1.8, 1)
-            predicted_path.append([round(cur_e, 1), round(cur_n, 1), round(cur_u, 1), cep_radius])
-
-        cardinals = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE", "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"]
-        cardinal = cardinals[int(((bearing_deg + 11.25) % 360) / 22.5)]
-        lat, lon = enu_to_geodetic(self.east_m, self.north_m)
-
-        rssi_dbm = (
-            -110.0
-            if self.rf_protocol == "RF_SILENT_AUTONOMOUS"
-            else round(-36.0 - 20.0 * math.log10(max(slant_range, 10.0)), 1)
-        )
-
-        return {
-            "target_id": self.target_id,
-            "affiliation": self.affiliation,
-            "drone_class": self.drone_class,
-            "rf_protocol": self.rf_protocol,
-            "east_m": round(self.east_m, 1),
-            "north_m": round(self.north_m, 1),
-            "alt_m": round(self.alt_m, 1),
-            "lat": lat,
-            "lon": lon,
-            "range_m": round(range_2d, 1),
-            "slant_range_m": round(slant_range, 1),
-            "bearing_deg": round(bearing_deg, 1),
-            "bearing_cardinal": cardinal,
-            "speed_ms": round(speed_ms, 1),
-            "closing_vel_ms": round(closing_vel, 1),
-            "vz_ms": round(self.vz_ms, 1),
-            "tti_s": tti_s,
-            "zone": zone,
-            "zone_code": zone_code,
-            "confidence": round(self.confidence * 100.0, 1),
-            "threat_score": threat_score,
-            "sub_scores": sub_scores,
-            "rcs_dbsm": self.rcs_dbsm,
-            "rotor_rpm": round(self.rotor_rpm, 0),
-            "rssi_dbm": rssi_dbm,
-            "payload_detected": self.payload_detected,
-            "imm_modes": imm_modes,
-            "dominant_mode": dominant_mode,
-            "status": self.status,
-            "kill_chain_stage": self.kill_chain_stage,
-            "kill_chain_num": stage_num,
-            "active_effectors": self.active_effectors,
-            "wta_recommendation": wta_rec,
-            "p_success": round(p_success * 100.0, 1),
-            "corroboration": (
-                ["EO", "RAD"]
-                if self.rf_protocol == "RF_SILENT_AUTONOMOUS"
-                else ["EO", "RAD", "RF"]
-            ),
-            "trail": self.trail[-28:],
-            "predicted_path": predicted_path,
-            "is_friendly": self.is_friendly,
-            "callsign": self.callsign,
-        }
 
 
-class MissionFlightRecorder:
-    """3,600-frame in-memory ring buffer recording full battlespace snapshots for debrief & scrubbing."""
-    def __init__(self, max_frames: int = 3600):
-        self.max_frames = max_frames
-        self.frames: List[Dict[str, Any]] = []
+class LatticeMissionAutonomyEngine:
+    """
+    End-to-End Mission Autonomy Engine:
+      - Pre-Mission Threat Modeling & Wargaming
+      - Live Multi-Asset Swarm Orchestration (HOTL + Autonomous ROE)
+      - Closed-Loop Flight Recorder & Post-Mission Debrief Playback
+    """
 
-    def record_frame(self, frame_data: Dict[str, Any]):
-        if len(self.frames) >= self.max_frames:
-            self.frames.pop(0)
-        self.frames.append(frame_data)
-
-    def get_frame(self, index: int) -> Optional[Dict[str, Any]]:
-        if not self.frames:
-            return None
-        idx = max(0, min(len(self.frames) - 1, index))
-        return self.frames[idx]
-
-    def total_frames(self) -> int:
-        return len(self.frames)
-
-
-class TacticalBattlespaceEngine:
-    """Multi-Sensor 3D Swarm Kinematics, Collaborative Assets & Autonomy Playbook Engine."""
-
-    def __init__(self, audit_ledger: LatticeAuditLedger) -> None:
+    def __init__(
+        self, cuda_engine: CudaTacticalComputeEngine, audit_ledger: LatticeAuditLedger
+    ) -> None:
+        self.cuda = cuda_engine
         self.audit = audit_ledger
-        self.cuda_engine = get_cuda_engine()
-        self.scenario = "SWARM_SATURATION"
-        self.roe_mode = "HOTL_SUPERVISED"        # "HOTL_SUPERVISED" or "FULL_AUTONOMOUS_ROE"
-        self.mission_phase = "LIVE_EXECUTION"    # "PRE_MISSION", "LIVE_EXECUTION", "POST_MISSION"
+        self.mission_phase = "LIVE_EXECUTION"  # PRE_MISSION, LIVE_EXECUTION, POST_MISSION
+        self.scenario = "PINCER_SWARM_10"
+        self.roe_mode = "HOTL_SUPERVISED"  # HOTL_SUPERVISED or FULL_AUTONOMOUS_ROE
+        self.killzone_radius_m = 500.0
+        self.warning_radius_m = 1500.0
+        self.detection_radius_m = 3500.0
+
         self.boot_time = time.time()
         self.last_tick = time.time()
         self.radar_sweep_deg = 0.0
         self.neutralized_count = 0
-        self.selected_target_id = "#101-ALPHA"
-        self.tracks: Dict[str, TacticalTrack] = {}
-        self.splash_events: List[Dict[str, Any]] = []
+        self.total_detected_count = 0
+        self.selected_target_id = "#TGT-101"
 
-        self.flight_recorder = MissionFlightRecorder(max_frames=3600)
-        self.current_autonomy_play = "PLAY_01_PERIMETER_CAP"
-        self.pending_intent: Optional[Dict[str, Any]] = None
+        self.entities: Dict[str, SwarmEntity] = {}
+        self.splash_events: List[Dict[str, Any]] = []
+        self.pending_autonomy_play: Optional[Dict[str, Any]] = None
+        self.active_play_id: str = "NONE"
+
+        # Closed-Loop Mission Flight Recorder (stores up to 1800 snapshots)
+        self.recorded_frames: Deque[Dict[str, Any]] = deque(maxlen=1800)
+        self.replay_index: int = 0
+        self.replay_playing: bool = True
+        self.replay_speed: int = 1
 
         self.effectors: Dict[str, Dict[str, Any]] = {
             "RF_JAMMER": {
                 "id": "RF_JAMMER",
                 "name": "DIRECTIONAL RF JAMMER",
-                "band": "2.4 / 5.8 GHz",
                 "state": "STANDBY",
-                "target_id": None,
                 "azimuth_deg": 48.0,
-                "power_kw": 2.8,
+                "target_id": None,
             },
             "GNSS_SPOOFER": {
                 "id": "GNSS_SPOOFER",
-                "name": "GNSS / GPS SPOOFER",
-                "band": "L1 / L5 EPHEMERIS",
+                "name": "GNSS EPHEMERIS SPOOFER",
                 "state": "STANDBY",
-                "target_id": None,
                 "azimuth_deg": 0.0,
-                "power_kw": 1.4,
+                "target_id": None,
             },
             "OPTICAL_DAZZLER": {
                 "id": "OPTICAL_DAZZLER",
-                "name": "SWIR OPTICAL DAZZLER",
-                "band": "1064nm DIRECTED",
+                "name": "1064nm SWIR DAZZLER",
                 "state": "STANDBY",
-                "target_id": None,
                 "azimuth_deg": 48.0,
-                "power_kw": 0.95,
-            },
-            "KINETIC_INTERCEPTOR": {
-                "id": "KINETIC_INTERCEPTOR",
-                "name": "KINETIC INTERCEPTOR",
-                "band": "HARD-KILL SILO",
-                "state": "READY (6 SILOS)",
-                "ammo_remaining": 6,
                 "target_id": None,
-                "azimuth_deg": 0.0,
-                "power_kw": 0.0,
+            },
+            "KINETIC_SILO": {
+                "id": "KINETIC_SILO",
+                "name": "ANVIL KINETIC SILOS",
+                "state": "READY (8 READY)",
+                "ammo": 8,
+                "target_id": None,
             },
         }
-
         self.load_scenario(self.scenario)
 
     def load_scenario(self, scenario_name: str) -> None:
-        self.scenario = scenario_name
-        self.tracks.clear()
+        self.scenario = scenario_name.upper()
+        self.entities.clear()
+        self.splash_events.clear()
+        self.recorded_frames.clear()
+        self.replay_index = 0
+        self.active_play_id = "NONE"
+        self.pending_autonomy_play = None
 
-        # Collaborative Friendly Assets (Always active)
-        self.tracks["#ISR-01"] = TacticalTrack(
-            target_id="#ISR-01",
-            affiliation="FRIENDLY",
-            drone_class="FRIENDLY_WINGMAN",
-            rf_protocol="LINK-16_SECURE",
-            east_m=1200.0,
-            north_m=900.0,
-            alt_m=240.0,
-            vx_ms=-12.0,
-            vy_ms=16.0,
-            vz_ms=0.0,
-            rcs_dbsm=-18.0,
-            confidence=1.0,
-            status="ORBITING",
-            kill_chain_stage="TRACK",
-            is_friendly=True,
-            callsign="ISR-WINGMAN-01"
-        )
-        self.tracks["#ISR-02"] = TacticalTrack(
-            target_id="#ISR-02",
-            affiliation="FRIENDLY",
-            drone_class="FRIENDLY_WINGMAN",
-            rf_protocol="LINK-16_SECURE",
-            east_m=-1100.0,
-            north_m=-1000.0,
+        for eff in self.effectors.values():
+            if eff["id"] == "KINETIC_SILO":
+                eff["state"] = "READY (8 READY)"
+                eff["ammo"] = 8
+            else:
+                eff["state"] = "STANDBY"
+            eff["target_id"] = None
+
+        # Always deploy 2 Friendly Collaborative Autonomous ISR Wingmen
+        self.entities["#ISR-WING-01"] = SwarmEntity(
+            target_id="#ISR-WING-01",
+            cluster_id="FRIENDLY-CAP",
+            affiliation="FRIENDLY_WINGMAN",
+            drone_class="AUTONOMOUS_ISR_WINGMAN",
+            rf_protocol="MESH_ENCRYPTED",
+            east_m=240.0,
+            north_m=320.0,
             alt_m=220.0,
-            vx_ms=15.0,
-            vy_ms=-11.0,
+            vx_ms=-12.0,
+            vy_ms=10.0,
             vz_ms=0.0,
-            rcs_dbsm=-18.0,
+            rcs_dbsm=-8.0,
+            rotor_rpm=6800.0,
+            payload_detected=False,
             confidence=1.0,
-            status="ORBITING",
-            kill_chain_stage="TRACK",
-            is_friendly=True,
-            callsign="ISR-WINGMAN-02"
+            status="PATROL_CAP",
+            assigned_asset="SECTOR_NORTH_EAST",
+        )
+        self.entities["#ISR-WING-02"] = SwarmEntity(
+            target_id="#ISR-WING-02",
+            cluster_id="FRIENDLY-CAP",
+            affiliation="FRIENDLY_WINGMAN",
+            drone_class="AUTONOMOUS_ISR_WINGMAN",
+            rf_protocol="MESH_ENCRYPTED",
+            east_m=-340.0,
+            north_m=-260.0,
+            alt_m=210.0,
+            vx_ms=11.0,
+            vy_ms=-12.0,
+            vz_ms=0.0,
+            rcs_dbsm=-8.0,
+            rotor_rpm=6800.0,
+            payload_detected=False,
+            confidence=1.0,
+            status="PATROL_CAP",
+            assigned_asset="SECTOR_SOUTH_WEST",
         )
 
-        if scenario_name == "FPV_TERMINAL_DIVE":
-            self._spawn_dive_scenario()
-        elif scenario_name == "RF_SILENT_STEALTH":
-            self._spawn_stealth_scenario()
-        elif scenario_name == "MIXED_AIRSPACE":
-            self._spawn_mixed_scenario()
+        if self.scenario == "RF_SILENT_STEALTH":
+            angles = [35, 52, 145, 225, 310]
+            for i, deg in enumerate(angles, start=1):
+                rad = math.radians(deg)
+                dist = 780.0 + i * 165.0
+                tid = f"#TGT-20{i}"
+                self.entities[tid] = SwarmEntity(
+                    target_id=tid,
+                    cluster_id="CLUSTER-PHANTOM",
+                    affiliation="HOSTILE",
+                    drone_class="AUTONOMOUS_LOITERING_MUNITION",
+                    rf_protocol="RF_SILENT_OPTICAL_NAV",
+                    east_m=dist * math.sin(rad),
+                    north_m=dist * math.cos(rad),
+                    alt_m=95.0 + i * 22.0,
+                    vx_ms=-27.5 * math.sin(rad),
+                    vy_ms=-27.5 * math.cos(rad),
+                    vz_ms=-2.6,
+                    rcs_dbsm=-19.2,
+                    rotor_rpm=15800.0,
+                    payload_detected=True,
+                    confidence=0.955,
+                )
+        elif self.scenario == "FPV_TERMINAL_DIVE":
+            for i, (e, n, a) in enumerate(
+                [(310.0, 290.0, 180.0), (420.0, 190.0, 210.0), (-380.0, 340.0, 195.0)],
+                start=1,
+            ):
+                tid = f"#TGT-30{i}"
+                self.entities[tid] = SwarmEntity(
+                    target_id=tid,
+                    cluster_id="CLUSTER-STRIKE",
+                    affiliation="HOSTILE",
+                    drone_class="SUICIDE_FPV_MUNITION",
+                    rf_protocol="ExpressLRS 2.4GHz",
+                    east_m=e,
+                    north_m=n,
+                    alt_m=a,
+                    vx_ms=-e * 0.065,
+                    vy_ms=-n * 0.065,
+                    vz_ms=-7.2,
+                    ax_ms2=-2.5,
+                    ay_ms2=-2.1,
+                    rcs_dbsm=-17.0,
+                    rotor_rpm=16800.0,
+                    payload_detected=True,
+                    confidence=0.971,
+                )
         else:
-            self._spawn_saturation_scenario()
+            # Default: 8-UAV Multi-Axis Pincer Swarm
+            self.scenario = "PINCER_SWARM_10"
+            swarm_specs = [
+                ("#TGT-101", "CLUSTER-ALPHA", "HOSTILE", "SUICIDE_FPV_MUNITION", "ExpressLRS 2.4GHz", 330.0, 310.0, 145.0, -20.5, -21.0, -4.5, True),
+                ("#TGT-102", "CLUSTER-ALPHA", "HOSTILE", "SUICIDE_FPV_MUNITION", "ExpressLRS 2.4GHz", 440.0, 220.0, 160.0, -22.0, -16.5, -3.8, True),
+                ("#TGT-103", "CLUSTER-ALPHA", "HOSTILE", "CUSTOMIZED_BOMBER_UAV", "DJI OcuSync-3", 520.0, 390.0, 190.0, -21.0, -18.0, -2.5, True),
+                ("#TGT-104", "CLUSTER-BRAVO", "HOSTILE", "AUTONOMOUS_LOITERING_MUNITION", "RF_SILENT_OPTICAL_NAV", -680.0, 510.0, 230.0, 24.5, -18.5, -3.2, True),
+                ("#TGT-105", "CLUSTER-BRAVO", "HOSTILE", "AUTONOMOUS_LOITERING_MUNITION", "RF_SILENT_OPTICAL_NAV", -790.0, 380.0, 205.0, 26.0, -14.0, -2.9, True),
+                ("#TGT-106", "CLUSTER-CHARLIE", "HOSTILE", "SUICIDE_FPV_MUNITION", "TBS Crossfire", 140.0, -980.0, 120.0, -4.5, 28.0, -2.0, True),
+                ("#TGT-107", "CLUSTER-CHARLIE", "SUSPECT", "SURVEILLANCE_ISR_DRONE", "MAVLink 915MHz", -940.0, -820.0, 340.0, 13.0, 12.0, 0.0, False),
+                ("#CIV-801", "CIVILIAN-CORRIDOR", "NEUTRAL", "COMMERCIAL_QUADCOPTER", "RemoteID Broadcast", -1350.0, 1080.0, 115.0, 10.5, 2.5, 0.0, False),
+            ]
+            for tid, cl, aff, cls, rf, e, n, a, vx, vy, vz, pay in swarm_specs:
+                self.entities[tid] = SwarmEntity(
+                    target_id=tid,
+                    cluster_id=cl,
+                    affiliation=aff,
+                    drone_class=cls,
+                    rf_protocol=rf,
+                    east_m=e,
+                    north_m=n,
+                    alt_m=a,
+                    vx_ms=vx,
+                    vy_ms=vy,
+                    vz_ms=vz,
+                    payload_detected=pay,
+                )
+
+        hostiles = [
+            e.target_id for e in self.entities.values() if e.affiliation == "HOSTILE"
+        ]
+        self.total_detected_count = len(hostiles)
+        if hostiles:
+            self.selected_target_id = hostiles[0]
 
         self.audit.record_event(
-            event_type="SCENARIO_LOADED",
-            operator="AUTONOMOUS_CORE",
-            payload={"scenario": scenario_name, "active_tracks": len(self.tracks)},
+            "SCENARIO_CONFIGURED",
+            "LATTICE_MISSION_PLANNER",
+            {"scenario": self.scenario, "hostile_count": len(hostiles)},
         )
 
-    def _spawn_saturation_scenario(self) -> None:
-        presets = [
-            TacticalTrack(
-                target_id="#101-ALPHA",
-                affiliation="HOSTILE",
-                drone_class="SUICIDE_DRONE",
-                rf_protocol="ExpressLRS 2.4GHz",
-                east_m=1120.0,
-                north_m=980.0,
-                alt_m=210.0,
-                vx_ms=-24.5,
-                vy_ms=-21.5,
-                vz_ms=-5.5,
-                ax_ms2=-1.2,
-                ay_ms2=-1.0,
-                rcs_dbsm=-16.5,
-                rotor_rpm=17800,
-                payload_detected=True,
-                confidence=0.965,
-            ),
-            TacticalTrack(
-                target_id="#102-BRAVO",
-                affiliation="HOSTILE",
-                drone_class="SUICIDE_DRONE",
-                rf_protocol="TBS Crossfire",
-                east_m=-1280.0,
-                north_m=840.0,
-                alt_m=195.0,
-                vx_ms=26.0,
-                vy_ms=-17.2,
-                vz_ms=-4.8,
-                rcs_dbsm=-17.1,
-                rotor_rpm=18200,
-                payload_detected=True,
-                confidence=0.942,
-            ),
-            TacticalTrack(
-                target_id="#103-CHARLIE",
-                affiliation="HOSTILE",
-                drone_class="RECON_QUAD",
-                rf_protocol="DJI O3-Enterprise",
-                east_m=340.0,
-                north_m=1920.0,
-                alt_m=340.0,
-                vx_ms=-8.2,
-                vy_ms=-14.0,
-                vz_ms=-1.2,
-                rcs_dbsm=-13.8,
-                rotor_rpm=11400,
-                confidence=0.978,
-            ),
-            TacticalTrack(
-                target_id="#104-DELTA",
-                affiliation="HOSTILE",
-                drone_class="AUTONOMOUS_LOITERING",
-                rf_protocol="RF_SILENT_AUTONOMOUS",
-                east_m=-680.0,
-                north_m=1450.0,
-                alt_m=160.0,
-                vx_ms=18.5,
-                vy_ms=-22.0,
-                vz_ms=-6.0,
-                rcs_dbsm=-18.4,
-                rotor_rpm=15600,
-                payload_detected=True,
-                confidence=0.912,
-            ),
-            TacticalTrack(
-                target_id="#105-ECHO",
-                affiliation="HOSTILE",
-                drone_class="SUICIDE_DRONE",
-                rf_protocol="TBS Crossfire",
-                east_m=180.0,
-                north_m=-1180.0,
-                alt_m=110.0,
-                vx_ms=-3.5,
-                vy_ms=29.0,
-                vz_ms=-2.1,
-                rcs_dbsm=-15.9,
-                rotor_rpm=14200,
-                payload_detected=True,
-                confidence=0.952,
-            ),
-            TacticalTrack(
-                target_id="#106-FOXTROT",
-                affiliation="HOSTILE",
-                drone_class="CUSTOMIZED_DRONE",
-                rf_protocol="Lightbridge",
-                east_m=-340.0,
-                north_m=1290.0,
-                alt_m=285.0,
-                vx_ms=8.5,
-                vy_ms=-26.0,
-                vz_ms=-3.2,
-                rcs_dbsm=-14.1,
-                rotor_rpm=11600,
-                payload_detected=True,
-                confidence=0.918,
-            ),
+    # ------------------------------------------------------------------------
+    # HUMAN-ON-THE-LOOP (HOTL) AUTONOMY PLAY EXECUTION
+    # ------------------------------------------------------------------------
+    def execute_autonomy_play(
+        self, play_id: str, operator: str = "HOTL_COMMANDER"
+    ) -> Dict[str, Any]:
+        play = play_id.upper()
+        self.active_play_id = play
+        self.pending_autonomy_play = None
+
+        if play in ("PLAY_04_CEASEFIRE_RTB", "CEASEFIRE", "DISENGAGE_ALL"):
+            return self.ceasefire_and_rtb(operator)
+
+        hostiles = [
+            e
+            for e in self.entities.values()
+            if e.affiliation in ("HOSTILE", "SUSPECT") and e.status != "NEUTRALIZED"
         ]
-        for t in presets:
-            self.tracks[t.target_id] = t
-        self.selected_target_id = "#101-ALPHA"
+        hostiles.sort(key=lambda x: math.hypot(x.east_m, x.north_m))
 
-    def _spawn_dive_scenario(self) -> None:
-        self.tracks["#101-ALPHA"] = TacticalTrack(
-            target_id="#101-ALPHA",
-            affiliation="HOSTILE",
-            drone_class="SUICIDE_DRONE",
-            rf_protocol="ExpressLRS 2.4GHz",
-            east_m=340.0,
-            north_m=310.0,
-            alt_m=210.0,
-            vx_ms=-24.5,
-            vy_ms=-22.0,
-            vz_ms=-9.5,
-            ax_ms2=-3.8,
-            ay_ms2=-3.2,
-            rcs_dbsm=-16.8,
-            rotor_rpm=16200,
-            payload_detected=True,
-            confidence=0.948,
-        )
-        self.tracks["#102-BRAVO"] = TacticalTrack(
-            target_id="#102-BRAVO",
-            affiliation="HOSTILE",
-            drone_class="SUICIDE_DRONE",
-            rf_protocol="TBS Crossfire",
-            east_m=-480.0,
-            north_m=380.0,
-            alt_m=240.0,
-            vx_ms=21.0,
-            vy_ms=-18.5,
-            vz_ms=-7.2,
-            payload_detected=True,
-            confidence=0.934,
-        )
-        self.selected_target_id = "#101-ALPHA"
+        if play == "PLAY_01_PERIMETER_CAP":
+            # Task friendly ISR Wingmen to shadow top 2 hostile clusters
+            wingmen = [
+                e for e in self.entities.values() if e.affiliation == "FRIENDLY_WINGMAN"
+            ]
+            for idx, wm in enumerate(wingmen):
+                if idx < len(hostiles):
+                    wm.intercept_target_id = hostiles[idx].target_id
+                    wm.status = f"SHADOWING {hostiles[idx].target_id}"
+                    hostiles[idx].assigned_asset = wm.target_id
+            block = self.audit.record_event(
+                "AUTONOMY_PLAY_EXECUTED",
+                operator,
+                {"play": play, "wingmen_tasked": len(wingmen)},
+            )
+            return {"status": "EXECUTED", "play": play, "hash": block["block_hash"]}
 
-    def _spawn_stealth_scenario(self) -> None:
-        self.tracks["#104-DELTA"] = TacticalTrack(
-            target_id="#104-DELTA",
-            affiliation="HOSTILE",
-            drone_class="AUTONOMOUS_LOITERING",
-            rf_protocol="RF_SILENT_AUTONOMOUS",
-            east_m=420.0,
-            north_m=620.0,
-            alt_m=140.0,
-            vx_ms=-14.0,
-            vy_ms=-17.0,
-            vz_ms=-3.5,
-            rcs_dbsm=-21.5,
-            rotor_rpm=13800,
-            payload_detected=True,
-            confidence=0.885,
-        )
-        self.selected_target_id = "#104-DELTA"
+        if play == "PLAY_02_SWARM_EW_BARRIER":
+            # Synchronized RF Jamming + GNSS Spoofing + SWIR Dazzler across swarm
+            if hostiles:
+                lead = hostiles[0]
+                az = (math.degrees(math.atan2(lead.east_m, lead.north_m)) + 360.0) % 360.0
+                self.effectors["RF_JAMMER"]["state"] = "ENGAGED (BARRIER)"
+                self.effectors["RF_JAMMER"]["azimuth_deg"] = round(az, 1)
+                self.effectors["RF_JAMMER"]["target_id"] = lead.target_id
+                self.effectors["GNSS_SPOOFER"]["state"] = "ENGAGED (DIVERT)"
+                self.effectors["GNSS_SPOOFER"]["target_id"] = lead.target_id
+                self.effectors["OPTICAL_DAZZLER"]["state"] = "ENGAGED (SWIR)"
+                self.effectors["OPTICAL_DAZZLER"]["azimuth_deg"] = round(az, 1)
+                self.effectors["OPTICAL_DAZZLER"]["target_id"] = lead.target_id
 
-    def _spawn_mixed_scenario(self) -> None:
-        self.tracks["#101-ALPHA"] = TacticalTrack(
-            target_id="#101-ALPHA",
-            affiliation="HOSTILE",
-            drone_class="SUICIDE_DRONE",
-            rf_protocol="ExpressLRS 2.4GHz",
-            east_m=490.0,
-            north_m=460.0,
-            alt_m=160.0,
-            vx_ms=-18.0,
-            vy_ms=-17.0,
-            vz_ms=-4.2,
-            payload_detected=True,
-            confidence=0.95,
-        )
-        self.tracks["#CIV-09"] = TacticalTrack(
-            target_id="#CIV-09",
-            affiliation="CIVILIAN",
-            drone_class="COMMERCIAL_CINELIFTER",
-            rf_protocol="WiFi-Beacon",
-            east_m=-740.0,
-            north_m=1120.0,
-            alt_m=85.0,
-            vx_ms=6.0,
-            vy_ms=4.0,
-            vz_ms=0.0,
-            rcs_dbsm=-11.0,
-            rotor_rpm=8400,
-            confidence=0.99,
-        )
-        self.selected_target_id = "#101-ALPHA"
+            affected = 0
+            for h in hostiles:
+                if math.hypot(h.east_m, h.north_m) < 1350.0:
+                    if h.rf_protocol == "RF_SILENT_OPTICAL_NAV":
+                        if "OPTICAL_DAZZLER" not in h.active_effectors:
+                            h.active_effectors.append("OPTICAL_DAZZLER")
+                        h.assigned_asset = "SWIR_DAZZLER"
+                    else:
+                        if "RF_JAMMER" not in h.active_effectors:
+                            h.active_effectors.append("RF_JAMMER")
+                        if "GNSS_SPOOFER" not in h.active_effectors:
+                            h.active_effectors.append("GNSS_SPOOFER")
+                        h.assigned_asset = "EW_BARRIER"
+                    affected += 1
 
-    def step(self) -> None:
+            block = self.audit.record_event(
+                "AUTONOMY_PLAY_EXECUTED",
+                operator,
+                {"play": play, "targets_suppressed": affected},
+            )
+            return {"status": "EXECUTED", "play": play, "affected": affected, "hash": block["block_hash"]}
+
+        if play == "PLAY_03_KINETIC_WOLF_PACK":
+            # Global WTAA dispatch of up to 3 synchronized ANVIL kinetic interceptors
+            launched = 0
+            for h in hostiles[:3]:
+                ammo = self.effectors["KINETIC_SILO"].get("ammo", 0)
+                if ammo <= 0:
+                    break
+                already = any(
+                    e.affiliation == "FRIENDLY_INTERCEPTOR"
+                    and e.intercept_target_id == h.target_id
+                    for e in self.entities.values()
+                )
+                if already:
+                    continue
+                self.effectors["KINETIC_SILO"]["ammo"] = ammo - 1
+                icp_id = f"#ANVIL-{random.randint(10, 99)}"
+                self.entities[icp_id] = SwarmEntity(
+                    target_id=icp_id,
+                    cluster_id="WOLF-PACK",
+                    affiliation="FRIENDLY_INTERCEPTOR",
+                    drone_class="ANVIL_KINETIC_INTERCEPTOR",
+                    rf_protocol="LINK-16_DATALINK",
+                    east_m=random.uniform(-25.0, 25.0),
+                    north_m=random.uniform(-25.0, 25.0),
+                    alt_m=24.0,
+                    vx_ms=0.0,
+                    vy_ms=0.0,
+                    vz_ms=20.0,
+                    confidence=1.0,
+                    status=f"INTERCEPT -> {h.target_id}",
+                    assigned_asset=h.target_id,
+                    intercept_target_id=h.target_id,
+                )
+                h.assigned_asset = icp_id
+                launched += 1
+
+            rem = self.effectors["KINETIC_SILO"]["ammo"]
+            self.effectors["KINETIC_SILO"]["state"] = f"ACTIVE ({rem} SILOS)"
+            block = self.audit.record_event(
+                "AUTONOMY_PLAY_EXECUTED",
+                operator,
+                {"play": play, "interceptors_launched": launched},
+            )
+            return {"status": "EXECUTED", "play": play, "launched": launched, "hash": block["block_hash"]}
+
+        return {"status": "UNKNOWN_PLAY", "play": play}
+
+    def engage_single_effector(
+        self, effector: str, target_id: Optional[str] = None, operator: str = "HOTL_COMMANDER"
+    ) -> Dict[str, Any]:
+        eff_upper = effector.upper()
+        if eff_upper in ("DISENGAGE_ALL", "CEASEFIRE", "PLAY_04_CEASEFIRE_RTB"):
+            return self.ceasefire_and_rtb(operator)
+        if eff_upper.startswith("PLAY_"):
+            return self.execute_autonomy_play(eff_upper, operator)
+
+        tgt_id = target_id or self.selected_target_id
+        trk = self.entities.get(tgt_id)
+        if not trk:
+            return {"status": "NO_TARGET"}
+
+        if eff_upper in ("KINETIC_INTERCEPTOR", "KINETIC_SILO", "INTERCEPTOR"):
+            ammo = self.effectors["KINETIC_SILO"].get("ammo", 0)
+            if ammo > 0:
+                self.effectors["KINETIC_SILO"]["ammo"] = ammo - 1
+            icp_id = f"#ANVIL-{random.randint(10, 99)}"
+            self.entities[icp_id] = SwarmEntity(
+                target_id=icp_id,
+                cluster_id="INTERCEPT",
+                affiliation="FRIENDLY_INTERCEPTOR",
+                drone_class="ANVIL_KINETIC_INTERCEPTOR",
+                rf_protocol="LINK-16_DATALINK",
+                east_m=0.0,
+                north_m=0.0,
+                alt_m=22.0,
+                vx_ms=0.0,
+                vy_ms=0.0,
+                vz_ms=18.0,
+                confidence=1.0,
+                status=f"INTERCEPT -> {trk.target_id}",
+                assigned_asset=trk.target_id,
+                intercept_target_id=trk.target_id,
+            )
+            trk.assigned_asset = icp_id
+            rem = self.effectors["KINETIC_SILO"]["ammo"]
+            self.effectors["KINETIC_SILO"]["state"] = f"LAUNCHED ({rem} SILOS)"
+            canonical = "KINETIC_SILO"
+        else:
+            canonical = (
+                "GNSS_SPOOFER"
+                if "SPOOF" in eff_upper
+                else ("OPTICAL_DAZZLER" if "DAZZL" in eff_upper else "RF_JAMMER")
+            )
+            if canonical not in trk.active_effectors:
+                trk.active_effectors.append(canonical)
+            trk.assigned_asset = canonical
+            az = (math.degrees(math.atan2(trk.east_m, trk.north_m)) + 360.0) % 360.0
+            self.effectors[canonical]["state"] = "ENGAGED"
+            self.effectors[canonical]["azimuth_deg"] = round(az, 1)
+            self.effectors[canonical]["target_id"] = trk.target_id
+
+        block = self.audit.record_event(
+            "EFFECTOR_ENGAGED",
+            operator,
+            {"effector": canonical, "target_id": trk.target_id},
+        )
+        return {"status": "ENGAGED", "effector": canonical, "target_id": trk.target_id, "hash": block["block_hash"]}
+
+    def ceasefire_and_rtb(self, operator: str = "HOTL_COMMANDER") -> Dict[str, Any]:
+        self.active_play_id = "PLAY_04_CEASEFIRE_RTB"
+        self.pending_autonomy_play = None
+        for eff in self.effectors.values():
+            if eff["id"] == "KINETIC_SILO":
+                eff["state"] = f"READY ({eff.get('ammo', 8)} READY)"
+            else:
+                eff["state"] = "STANDBY"
+            eff["target_id"] = None
+
+        to_del = []
+        for tid, ent in self.entities.items():
+            if ent.affiliation == "FRIENDLY_INTERCEPTOR":
+                to_del.append(tid)
+            elif ent.affiliation == "FRIENDLY_WINGMAN":
+                ent.intercept_target_id = None
+                ent.status = "RTB_ORBIT"
+                ent.assigned_asset = "BASE_PERIMETER"
+            else:
+                ent.active_effectors.clear()
+                ent.status = "ACTIVE"
+                ent.assigned_asset = "UNASSIGNED"
+        for tid in to_del:
+            self.entities.pop(tid, None)
+
+        block = self.audit.record_event(
+            "EMERGENCY_CEASEFIRE_RTB", operator, {"status": "ALL_EMITTERS_SAFE"}
+        )
+        return {"status": "CEASEFIRE_ACTIVE", "hash": block["block_hash"]}
+
+    # ------------------------------------------------------------------------
+    # REAL-TIME SIMULATION STEP & CUDA SNAPSHOT GENERATION
+    # ------------------------------------------------------------------------
+    def step_simulation(self) -> None:
         now = time.time()
-        dt = min(0.1, max(0.01, now - self.last_tick))
+        dt = min(max(now - self.last_tick, 0.01), 0.25)
         self.last_tick = now
 
-        self.radar_sweep_deg = (self.radar_sweep_deg + 360.0 * 2.0 * dt) % 360.0
-        self.splash_events = [e for e in self.splash_events if now - e["time"] < 2.5]
+        if self.mission_phase != "LIVE_EXECUTION":
+            return
 
-        to_remove = []
+        self.radar_sweep_deg = (self.radar_sweep_deg + 145.0 * dt) % 360.0
+        self.splash_events = [s for s in self.splash_events if now - s["time"] < 2.6]
 
-        # Orbit friendly ISR wingmen
-        for c_id, trk in self.tracks.items():
-            if trk.is_friendly and trk.status == "ORBITING":
-                orbit_speed = 0.08
-                phase = 0.0 if "01" in c_id else math.pi
-                theta = (now * orbit_speed + phase) % (2.0 * math.pi)
-                radius = 1500.0
-                trk.east_m = radius * math.cos(theta)
-                trk.north_m = radius * math.sin(theta)
-                trk.vx_ms = -radius * orbit_speed * math.sin(theta)
-                trk.vy_ms = radius * orbit_speed * math.cos(theta)
+        to_remove: List[str] = []
 
-        # Update kinetic interceptors with proportional navigation
-        for icp_id, icp in list(self.tracks.items()):
-            if icp.drone_class != "KINETIC_INTERCEPTOR" or icp.status != "INTERCEPTING":
+        # 1. Update Friendly Autonomous Wingmen & Kinetic Interceptors
+        for ent in list(self.entities.values()):
+            if ent.affiliation == "FRIENDLY_INTERCEPTOR":
+                tgt = self.entities.get(ent.intercept_target_id or "")
+                if not tgt:
+                    to_remove.append(ent.target_id)
+                    continue
+                dx = tgt.east_m - ent.east_m
+                dy = tgt.north_m - ent.north_m
+                dz = tgt.alt_m - ent.alt_m
+                dist = math.sqrt(dx * dx + dy * dy + dz * dz)
+                if dist < 46.0:
+                    self.neutralized_count += 1
+                    self.splash_events.append(
+                        {
+                            "east_m": round(tgt.east_m, 1),
+                            "north_m": round(tgt.north_m, 1),
+                            "alt_m": round(tgt.alt_m, 1),
+                            "target_id": tgt.target_id,
+                            "time": now,
+                        }
+                    )
+                    to_remove.append(ent.target_id)
+                    to_remove.append(tgt.target_id)
+                    self.audit.record_event(
+                        "BDA_KINETIC_SPLASH",
+                        "ANVIL_AUTONOMOUS_INTERCEPTOR",
+                        {"interceptor": ent.target_id, "target": tgt.target_id},
+                    )
+                else:
+                    spd = 78.0
+                    ent.vx_ms = (dx / dist) * spd
+                    ent.vy_ms = (dy / dist) * spd
+                    ent.vz_ms = (dz / dist) * spd
+                    ent.east_m += ent.vx_ms * dt
+                    ent.north_m += ent.vy_ms * dt
+                    ent.alt_m += ent.vz_ms * dt
+                    ent.trail.append([round(ent.east_m, 1), round(ent.north_m, 1)])
+
+            elif ent.affiliation == "FRIENDLY_WINGMAN":
+                tgt = self.entities.get(ent.intercept_target_id or "")
+                if tgt:
+                    orbit_ang = now * 0.9 + (0 if ent.target_id.endswith("01") else math.pi)
+                    goal_e = tgt.east_m + 180.0 * math.cos(orbit_ang)
+                    goal_n = tgt.north_m + 180.0 * math.sin(orbit_ang)
+                    ent.vx_ms = (goal_e - ent.east_m) * 0.8
+                    ent.vy_ms = (goal_n - ent.north_m) * 0.8
+                else:
+                    cap_ang = now * 0.35 + (0 if ent.target_id.endswith("01") else math.pi)
+                    goal_e = 450.0 * math.cos(cap_ang)
+                    goal_n = 450.0 * math.sin(cap_ang)
+                    ent.vx_ms = (goal_e - ent.east_m) * 0.6
+                    ent.vy_ms = (goal_n - ent.north_m) * 0.6
+                ent.east_m += ent.vx_ms * dt
+                ent.north_m += ent.vy_ms * dt
+                ent.trail.append([round(ent.east_m, 1), round(ent.north_m, 1)])
+
+        # 2. Update Hostile / Suspect / Neutral Tracks
+        for tid, trk in list(self.entities.items()):
+            if trk.affiliation.startswith("FRIENDLY") or tid in to_remove:
                 continue
-            tgt = self.tracks.get(icp.intercept_target_id or "")
-            if not tgt or tgt.status == "SPLASH":
-                icp.status = "RTB"
-                continue
 
-            dx = tgt.east_m - icp.east_m
-            dy = tgt.north_m - icp.north_m
-            dz = tgt.alt_m - icp.alt_m
-            dist = math.sqrt(dx**2 + dy**2 + dz**2)
-
-            if dist < 12.0:
-                tgt.status = "SPLASH"
-                to_remove.append(tgt.target_id)
-                to_remove.append(icp.target_id)
-                self.neutralized_count += 1
-                self.splash_events.append(
-                    {"east_m": round(tgt.east_m, 1), "north_m": round(tgt.north_m, 1), "alt_m": round(tgt.alt_m, 1), "time": now}
-                )
-                self.audit.record_event(
-                    "BDA_KINETIC_SPLASH",
-                    "ANVIL_INTERCEPTOR",
-                    {"interceptor": icp.target_id, "neutralized_target": tgt.target_id},
-                )
-            else:
-                speed = 78.0
-                icp.vx_ms = (dx / dist) * speed
-                icp.vy_ms = (dy / dist) * speed
-                icp.vz_ms = (dz / dist) * speed
-                icp.east_m += icp.vx_ms * dt
-                icp.north_m += icp.vy_ms * dt
-                icp.alt_m += icp.vz_ms * dt
-                icp.trail.append([round(icp.east_m, 1), round(icp.north_m, 1), round(icp.alt_m, 1)])
-
-        # Update hostile tracks
-        for tid, trk in list(self.tracks.items()):
-            if trk.affiliation == "FRIENDLY" or tid in to_remove:
-                continue
-
-            if "RF_JAMMER" in trk.active_effectors and trk.rf_protocol != "RF_SILENT_AUTONOMOUS":
+            if "RF_JAMMER" in trk.active_effectors and trk.rf_protocol != "RF_SILENT_OPTICAL_NAV":
                 trk.status = "JAMMED"
-                trk.kill_chain_stage = "ENGAGE"
-                trk.vx_ms *= 0.90
-                trk.vy_ms *= 0.90
-                trk.vz_ms = -2.5
+                trk.vx_ms *= 0.91
+                trk.vy_ms *= 0.91
+                trk.vz_ms = -2.2
             if "GNSS_SPOOFER" in trk.active_effectors:
                 trk.status = "SPOOFED"
-                trk.kill_chain_stage = "ENGAGE"
                 away = math.atan2(trk.east_m, trk.north_m)
-                trk.vx_ms = 24.0 * math.sin(away)
-                trk.vy_ms = 24.0 * math.cos(away)
-                trk.vz_ms = 0.8
+                trk.vx_ms = 23.0 * math.sin(away)
+                trk.vy_ms = 23.0 * math.cos(away)
+                trk.vz_ms = 0.6
             if "OPTICAL_DAZZLER" in trk.active_effectors:
                 trk.status = "DAZZLED"
-                trk.kill_chain_stage = "ENGAGE"
                 trk.ax_ms2 = random.uniform(-12.0, 12.0)
                 trk.ay_ms2 = random.uniform(-12.0, 12.0)
 
             rng = math.hypot(trk.east_m, trk.north_m)
             if trk.status == "ACTIVE" and trk.affiliation == "HOSTILE":
-                weave = math.sin(now * 1.8 + hash(tid) % 10) * 3.5
-                trk.ax_ms2 = weave
-                trk.ay_ms2 = -weave
-                if rng < 90.0:
+                swirl = math.sin(now * 1.8 + hash(tid) % 11) * 3.2
+                trk.ax_ms2 = swirl
+                trk.ay_ms2 = -swirl
+                if rng < 85.0:
                     ang = random.uniform(0, 2 * math.pi)
-                    trk.east_m = 1580.0 * math.sin(ang)
-                    trk.north_m = 1580.0 * math.cos(ang)
-                    trk.alt_m = random.uniform(130.0, 290.0)
-                    trk.vx_ms = -23.0 * math.sin(ang)
-                    trk.vy_ms = -23.0 * math.cos(ang)
+                    trk.east_m = 1650.0 * math.sin(ang)
+                    trk.north_m = 1650.0 * math.cos(ang)
+                    trk.alt_m = random.uniform(130.0, 280.0)
+                    trk.vx_ms = -22.5 * math.sin(ang)
+                    trk.vy_ms = -22.5 * math.cos(ang)
                     trk.trail.clear()
 
             trk.east_m += trk.vx_ms * dt
@@ -744,332 +904,280 @@ class TacticalBattlespaceEngine:
             if len(trk.trail) == 0 or math.hypot(
                 trk.east_m - trk.trail[-1][0], trk.north_m - trk.trail[-1][1]
             ) > 15.0:
-                trk.trail.append([round(trk.east_m, 1), round(trk.north_m, 1), round(trk.alt_m, 1)])
+                trk.trail.append([round(trk.east_m, 1), round(trk.north_m, 1)])
 
-            if trk.status in ("JAMMED", "SPOOFED") and (rng > 2400.0 or trk.alt_m <= 11.0):
+            if trk.status in ("JAMMED", "SPOOFED") and (rng > 2500.0 or trk.alt_m <= 11.0):
                 self.neutralized_count += 1
-                self.splash_events.append(
-                    {"east_m": round(trk.east_m, 1), "north_m": round(trk.north_m, 1), "alt_m": round(trk.alt_m, 1), "target_id": trk.target_id, "time": now}
-                )
                 to_remove.append(tid)
 
         for tid in set(to_remove):
-            self.tracks.pop(tid, None)
+            self.entities.pop(tid, None)
 
-        if not [t for t in self.tracks.values() if t.affiliation != "FRIENDLY"]:
+        active_hostiles = [
+            e for e in self.entities.values() if e.affiliation in ("HOSTILE", "SUSPECT")
+        ]
+        if not active_hostiles:
             self.load_scenario(self.scenario)
+            active_hostiles = [
+                e for e in self.entities.values() if e.affiliation in ("HOSTILE", "SUSPECT")
+            ]
 
-        # Autonomy Play Logic & Intent Evaluation
-        hostile_tracks = [t for t in self.tracks.values() if t.affiliation == "HOSTILE"]
-        critical_inbounds = [t for t in hostile_tracks if math.hypot(t.east_m, t.north_m) < 800.0]
-
-        if critical_inbounds:
-            target_ids = [t.target_id for t in critical_inbounds]
-            if self.roe_mode == "FULL_AUTONOMOUS_ROE":
-                self.execute_autonomy_play("PLAY_03_KINETIC_WOLF_PACK", target_ids, operator="AUTONOMOUS_CORE")
-            else:
-                self.pending_intent = {
-                    "play_id": f"PLAY-KW-{int(now)}",
-                    "play_type": "PLAY_03_KINETIC_WOLF_PACK",
-                    "title": "PLAY 03: KINETIC WOLF PACK",
-                    "description": f"Launch Anvil Interceptors against {len(target_ids)} terminal dive target(s).",
-                    "target_ids": target_ids,
-                    "timestamp": now,
-                    "status": "PENDING_APPROVAL"
-                }
-
-    def execute_autonomy_play(
-        self, play_type: str, target_ids: Optional[List[str]] = None, operator: str = "LATTICE_OPERATOR"
-    ) -> Dict[str, Any]:
-        target_ids = target_ids or []
-        self.current_autonomy_play = play_type
-        self.pending_intent = None
-
-        if play_type == "PLAY_01_PERIMETER_CAP":
-            for c_id in ["#ISR-01", "#ISR-02"]:
-                if c_id in self.tracks:
-                    self.tracks[c_id].status = "ORBITING"
-            msg = "Friendly ISR wingmen holding 1500m CAP orbit."
-
-        elif play_type == "PLAY_02_SWARM_EW_BARRIER":
-            self.effectors["RF_JAMMER"]["state"] = "ACTIVE_BARRIER"
-            self.effectors["GNSS_SPOOFER"]["state"] = "ACTIVE_BARRIER"
-            for t in self.tracks.values():
-                if t.affiliation == "HOSTILE":
-                    t.active_effectors = ["RF_JAMMER", "GNSS_SPOOFER"]
-            msg = "Synchronized RF & GNSS electronic screen active."
-
-        elif play_type == "PLAY_03_KINETIC_WOLF_PACK":
-            targets_to_engage = target_ids or [t.target_id for t in self.tracks.values() if t.affiliation == "HOSTILE"][:4]
-            dispatched = []
-            for i, tid in enumerate(targets_to_engage):
-                icp_id = f"#ANVIL-0{i+1}"
-                self.tracks[icp_id] = TacticalTrack(
-                    target_id=icp_id,
-                    affiliation="FRIENDLY",
-                    drone_class="KINETIC_INTERCEPTOR",
-                    rf_protocol="LINK-16_TACTICAL",
-                    east_m=0.0,
-                    north_m=0.0,
-                    alt_m=20.0,
-                    vx_ms=0.0,
-                    vy_ms=0.0,
-                    vz_ms=22.0,
-                    confidence=1.0,
-                    status="INTERCEPTING",
-                    kill_chain_stage="ENGAGE",
-                    intercept_target_id=tid,
-                    is_friendly=True,
-                    callsign=f"ANVIL-0{i+1}"
-                )
-                dispatched.append(icp_id)
-            msg = f"Kinetic Wolf Pack Salvo launched: {', '.join(dispatched)}."
-
-        elif play_type == "PLAY_04_CEASEFIRE_RTB":
-            self.disengage_all(operator)
-            for t in self.tracks.values():
-                if t.is_friendly:
-                    t.status = "RTB"
-            msg = "CEASEFIRE. All effectors STANDBY, all assets returning to base."
-        else:
-            msg = "Play not recognized."
-
-        self.audit.record_event(
-            event_type="AUTONOMY_PLAY_EXECUTED",
-            operator=operator,
-            payload={"play_type": play_type, "message": msg, "target_ids": target_ids},
-        )
-        return {"status": "EXECUTED", "play_type": play_type, "message": msg}
-
-    def engage_countermeasure(
-        self, effector_type: str, target_id: Optional[str] = None, operator: str = "LATTICE_OPERATOR"
-    ) -> Dict[str, Any]:
-        eff_key = effector_type.upper()
-        if eff_key in ("DISENGAGE_ALL", "EMERGENCY_DISENGAGE", "CEASEFIRE"):
-            return self.disengage_all(operator)
-
-        alias_map = {
-            "JAMMER": "RF_JAMMER",
-            "RF_JAMMER": "RF_JAMMER",
-            "SPOOFER": "GNSS_SPOOFER",
-            "GNSS_SPOOFER": "GNSS_SPOOFER",
-            "GPS_SPOOFER": "GNSS_SPOOFER",
-            "DAZZLER": "OPTICAL_DAZZLER",
-            "OPTICAL_DAZZLER": "OPTICAL_DAZZLER",
-            "INTERCEPTOR": "KINETIC_INTERCEPTOR",
-            "KINETIC_INTERCEPTOR": "KINETIC_INTERCEPTOR",
-        }
-        canonical = alias_map.get(eff_key, "RF_JAMMER")
-        tgt_id = target_id or self.selected_target_id
-        if tgt_id not in self.tracks and self.tracks:
-            tgt_id = next(iter(self.tracks.keys()))
-        trk = self.tracks.get(tgt_id)
-
-        if not trk:
-            return {"status": "NO_ACTIVE_TARGET", "effector": canonical}
-
-        bearing = (math.degrees(math.atan2(trk.east_m, trk.north_m)) + 360.0) % 360.0
-
-        if canonical == "KINETIC_INTERCEPTOR":
-            ammo = self.effectors["KINETIC_INTERCEPTOR"].get("ammo_remaining", 6)
-            if ammo > 0:
-                self.effectors["KINETIC_INTERCEPTOR"]["ammo_remaining"] = ammo - 1
-            icp_id = f"#ANVIL-{random.randint(10, 99)}"
-            self.tracks[icp_id] = TacticalTrack(
-                target_id=icp_id,
-                affiliation="FRIENDLY",
-                drone_class="KINETIC_INTERCEPTOR",
-                rf_protocol="LINK-16_TACTICAL",
-                east_m=0.0,
-                north_m=0.0,
-                alt_m=22.0,
-                vx_ms=0.0,
-                vy_ms=0.0,
-                vz_ms=18.0,
-                confidence=1.0,
-                status="INTERCEPTING",
-                kill_chain_stage="ENGAGE",
-                intercept_target_id=trk.target_id,
-                is_friendly=True,
-                callsign=icp_id
+        # 3. HOTL Autonomy Recommendation / Autonomous ROE Execution
+        killzone_breaches = [
+            h
+            for h in active_hostiles
+            if math.hypot(h.east_m, h.north_m) < self.killzone_radius_m and h.status == "ACTIVE"
+        ]
+        if killzone_breaches:
+            has_stealth = any(
+                h.rf_protocol == "RF_SILENT_OPTICAL_NAV" for h in killzone_breaches
             )
-            self.effectors[canonical]["state"] = f"LAUNCHED -> {trk.target_id}"
-            self.effectors[canonical]["target_id"] = trk.target_id
-        else:
-            if canonical not in trk.active_effectors:
-                trk.active_effectors.append(canonical)
-            self.effectors[canonical]["state"] = "ENGAGED"
-            self.effectors[canonical]["target_id"] = trk.target_id
-            self.effectors[canonical]["azimuth_deg"] = round(bearing, 1)
-
-        block = self.audit.record_event(
-            event_type="COUNTERMEASURE_ENGAGED",
-            operator=operator,
-            payload={
-                "effector": canonical,
-                "target_id": trk.target_id,
-                "bearing_deg": round(bearing, 1),
-                "range_m": round(math.hypot(trk.east_m, trk.north_m), 1),
-            },
-        )
-        return {
-            "status": "ENGAGED",
-            "effector": canonical,
-            "target_id": trk.target_id,
-            "audit_block_hash": block["block_hash"],
-        }
-
-    def disengage_all(self, operator: str = "LATTICE_OPERATOR") -> Dict[str, Any]:
-        for eff in self.effectors.values():
-            if eff["id"] == "KINETIC_INTERCEPTOR":
-                eff["state"] = f"READY ({eff.get('ammo_remaining', 6)} SILOS)"
+            rec_play = (
+                "PLAY_03_KINETIC_WOLF_PACK"
+                if (has_stealth or len(killzone_breaches) >= 2)
+                else "PLAY_02_SWARM_EW_BARRIER"
+            )
+            if self.roe_mode == "FULL_AUTONOMOUS_ROE":
+                self.execute_autonomy_play(rec_play, "FULL_AUTONOMOUS_ROE")
             else:
-                eff["state"] = "STANDBY"
-            eff["target_id"] = None
+                self.pending_autonomy_play = {
+                    "play_id": rec_play,
+                    "reason": f"{len(killzone_breaches)} HOSTILE(S) INSIDE {int(self.killzone_radius_m)}m KILLZONE",
+                    "confidence": 96.8,
+                }
+        else:
+            self.pending_autonomy_play = None
 
-        for trk in self.tracks.values():
-            if trk.affiliation != "FRIENDLY":
-                trk.active_effectors.clear()
-                trk.status = "ACTIVE"
-                trk.kill_chain_stage = "IDENTIFY"
+    def build_snapshot(self) -> Dict[str, Any]:
+        if self.mission_phase == "POST_MISSION" and self.recorded_frames:
+            if self.replay_playing:
+                self.replay_index = (self.replay_index + self.replay_speed) % len(
+                    self.recorded_frames
+                )
+            frame = copy.deepcopy(self.recorded_frames[self.replay_index])
+            frame["mission_phase"] = "POST_MISSION"
+            frame["replay_index"] = self.replay_index
+            frame["replay_total"] = len(self.recorded_frames)
+            frame["replay_playing"] = self.replay_playing
+            frame["replay_speed"] = self.replay_speed
+            return frame
 
-        block = self.audit.record_event(
-            event_type="EMERGENCY_CEASEFIRE",
-            operator=operator,
-            payload={"all_effectors": "STANDBY"},
+        self.step_simulation()
+
+        entity_list = list(self.entities.values())
+        positions = [[e.east_m, e.north_m, e.alt_m] for e in entity_list]
+        velocities = [[e.vx_ms, e.vy_ms, e.vz_ms] for e in entity_list]
+        accelerations = [[e.ax_ms2, e.ay_ms2, e.az_ms2] for e in entity_list]
+
+        gpu_out = self.cuda.compute_batched_ukf_predictions(
+            positions, velocities, accelerations
         )
-        return {"status": "ALL_EFFECTORS_DISENGAGED", "audit_block_hash": block["block_hash"]}
 
-    def get_snapshot(self) -> Dict[str, Any]:
-        self.step()
-        computed_tracks = [t.compute_metrics() for t in self.tracks.values()]
-        computed_tracks.sort(
-            key=lambda x: (-1 if x["affiliation"] == "FRIENDLY" else x["threat_score"]),
+        tracks_payload: List[Dict[str, Any]] = []
+        for idx, ent in enumerate(entity_list):
+            rng_2d = gpu_out["ranges"][idx]
+            closing = gpu_out["closing_vels"][idx]
+            dive_prob = gpu_out["imm_dive"][idx]
+            pred_path = gpu_out["trajectories"][idx]
+
+            slant = math.sqrt(rng_2d**2 + ent.alt_m**2)
+            bearing = (math.degrees(math.atan2(ent.east_m, ent.north_m)) + 360.0) % 360.0
+            speed = math.sqrt(ent.vx_ms**2 + ent.vy_ms**2 + ent.vz_ms**2)
+            tti = round(slant / max(closing, 0.5), 1) if closing > 0.8 else 999.0
+
+            if ent.affiliation.startswith("FRIENDLY"):
+                threat_score = 0.0
+            elif ent.affiliation == "NEUTRAL":
+                threat_score = 12.0
+            elif ent.status in ("JAMMED", "SPOOFED", "DAZZLED"):
+                threat_score = round(max(18.0, 46.0 - rng_2d * 0.01), 1)
+            else:
+                prox = max(0.0, (2500.0 - min(rng_2d, 2500.0)) / 2500.0) * 32.0
+                stealth = 11.0 if ent.rf_protocol == "RF_SILENT_OPTICAL_NAV" else 0.0
+                pay = 12.0 if ent.payload_detected else 0.0
+                threat_score = round(min(100.0, 48.0 * ent.confidence + prox + stealth + pay), 1)
+
+            zone_code = (
+                "RED"
+                if rng_2d < self.killzone_radius_m
+                else ("AMBER" if rng_2d < self.warning_radius_m else "GREEN")
+            )
+
+            tracks_payload.append(
+                {
+                    "target_id": ent.target_id,
+                    "cluster_id": ent.cluster_id,
+                    "affiliation": ent.affiliation,
+                    "drone_class": ent.drone_class,
+                    "rf_protocol": ent.rf_protocol,
+                    "east_m": round(ent.east_m, 1),
+                    "north_m": round(ent.north_m, 1),
+                    "alt_m": round(ent.alt_m, 1),
+                    "vx_ms": round(ent.vx_ms, 1),
+                    "vy_ms": round(ent.vy_ms, 1),
+                    "vz_ms": round(ent.vz_ms, 1),
+                    "range_m": rng_2d,
+                    "slant_range_m": round(slant, 1),
+                    "bearing_deg": round(bearing, 1),
+                    "speed_ms": round(speed, 1),
+                    "closing_vel_ms": closing,
+                    "tti_s": tti,
+                    "zone_code": zone_code,
+                    "threat_score": threat_score,
+                    "imm_dive_prob": dive_prob,
+                    "rcs_dbsm": ent.rcs_dbsm,
+                    "rotor_rpm": ent.rotor_rpm,
+                    "payload_detected": ent.payload_detected,
+                    "confidence": round(ent.confidence * 100.0, 1),
+                    "status": ent.status,
+                    "assigned_asset": ent.assigned_asset,
+                    "trail": ent.trail[-24:],
+                    "predicted_path": pred_path,
+                }
+            )
+
+        tracks_payload.sort(
+            key=lambda x: (-1.0 if x["affiliation"].startswith("FRIENDLY") else x["threat_score"]),
             reverse=True,
         )
 
-        if self.selected_target_id not in self.tracks and computed_tracks:
-            self.selected_target_id = computed_tracks[0]["target_id"]
+        if self.selected_target_id not in self.entities:
+            hostile_ids = [
+                t["target_id"]
+                for t in tracks_payload
+                if not t["affiliation"].startswith("FRIENDLY")
+            ]
+            if hostile_ids:
+                self.selected_target_id = hostile_ids[0]
 
-        max_threat = max((t["threat_score"] for t in computed_tracks if t["affiliation"] != "FRIENDLY"), default=0.0)
-        min_range = min(
-            (t["range_m"] for t in computed_tracks if t["affiliation"] != "FRIENDLY"),
-            default=9999.0,
+        locked = next(
+            (t for t in tracks_payload if t["target_id"] == self.selected_target_id),
+            tracks_payload[0] if tracks_payload else None,
         )
 
-        if min_range < 500.0 or max_threat >= 80.0:
-            defcon = 1
-            defcon_label = "DEFCON 1 // CRITICAL INTRUSION"
-        elif min_range < 1200.0 or max_threat >= 60.0:
-            defcon = 2
-            defcon_label = "DEFCON 2 // HOSTILE INBOUND"
-        elif max_threat >= 35.0:
-            defcon = 3
-            defcon_label = "DEFCON 3 // ELEVATED WATCH"
-        else:
-            defcon = 5
-            defcon_label = "DEFCON 5 // AIRSPACE NOMINAL"
+        now_t = time.time()
+        stft_matrix = self.cuda.compute_cuda_micro_doppler(
+            locked["rotor_rpm"] if locked else 14000.0,
+            locked["closing_vel_ms"] if locked else 22.0,
+            now_t,
+        )
+        rf_fft_bins = self.cuda.compute_cuda_rf_fft(
+            bool(locked and locked["rf_protocol"] == "RF_SILENT_OPTICAL_NAV"),
+            bool(locked and locked["status"] == "JAMMED"),
+            now_t,
+        )
 
-        gpu_telemetry = self.cuda_engine.get_telemetry()
+        max_threat = max((t["threat_score"] for t in tracks_payload), default=0.0)
+        min_rng = min(
+            (
+                t["range_m"]
+                for t in tracks_payload
+                if t["affiliation"] in ("HOSTILE", "SUSPECT")
+            ),
+            default=9999.0,
+        )
+        if min_rng < self.killzone_radius_m or max_threat >= 80.0:
+            defcon_label = "DEFCON 1 // SWARM BREACH"
+            defcon_num = 1
+        elif min_rng < self.warning_radius_m:
+            defcon_label = "DEFCON 2 // HOSTILE INBOUND"
+            defcon_num = 2
+        else:
+            defcon_label = "DEFCON 4 // PERIMETER WATCH"
+            defcon_num = 4
+
+        hostile_count = sum(
+            1 for t in tracks_payload if t["affiliation"] in ("HOSTILE", "SUSPECT")
+        )
+        friendly_count = sum(
+            1 for t in tracks_payload if t["affiliation"].startswith("FRIENDLY")
+        )
 
         snapshot = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "uptime_s": int(time.time() - self.boot_time),
+            "mission_phase": self.mission_phase,
             "scenario": self.scenario,
             "roe_mode": self.roe_mode,
-            "mission_phase": self.mission_phase,
-            "defcon": defcon,
+            "defcon_num": defcon_num,
             "defcon_label": defcon_label,
             "radar_sweep_deg": round(self.radar_sweep_deg, 1),
             "selected_target_id": self.selected_target_id,
-            "neutralized_count": self.neutralized_count,
-            "base_hq": {"lat": BASE_LAT, "lon": BASE_LON},
-            "tracks": computed_tracks,
+            "active_play_id": self.active_play_id,
+            "pending_autonomy_play": self.pending_autonomy_play,
+            "geofence": {
+                "killzone_m": self.killzone_radius_m,
+                "warning_m": self.warning_radius_m,
+                "detection_m": self.detection_radius_m,
+            },
+            "counts": {
+                "hostile": hostile_count,
+                "friendly": friendly_count,
+                "neutralized": self.neutralized_count,
+                "total_detected": self.total_detected_count + self.neutralized_count,
+            },
+            "cuda": self.cuda.get_hardware_telemetry(),
+            "micro_doppler_stft": stft_matrix,
+            "rf_fft_bins": rf_fft_bins,
+            "tracks": tracks_payload,
             "splash_events": self.splash_events,
             "effectors": list(self.effectors.values()),
-            "current_autonomy_play": self.current_autonomy_play,
-            "pending_intent": self.pending_intent,
-            "cuda_telemetry": gpu_telemetry,
             "audit_tail": self.audit.chain[-6:][::-1],
             "ledger_integrity": self.audit.verify_integrity(),
-            "flight_recorder_total_frames": self.flight_recorder.total_frames()
+            "replay_index": len(self.recorded_frames),
+            "replay_total": len(self.recorded_frames) + 1,
+            "replay_playing": False,
+            "replay_speed": self.replay_speed,
         }
 
-        # Record into flight recorder
-        self.flight_recorder.record_frame(snapshot)
+        if self.mission_phase == "LIVE_EXECUTION":
+            self.recorded_frames.append(copy.deepcopy(snapshot))
+            self.replay_index = len(self.recorded_frames) - 1
+
         return snapshot
 
-    def run_pre_mission_wargame(self, num_simulations: int = 500) -> Dict[str, Any]:
-        """Runs Monte Carlo wargame defense simulation."""
-        successes = 0
-        for _ in range(num_simulations):
-            swarm_n = random.randint(4, 10)
-            intercepted = min(swarm_n, random.randint(int(swarm_n * 0.9), swarm_n + 1))
-            if intercepted >= swarm_n:
-                successes += 1
-        p_survival = round((successes / num_simulations) * 100.0, 1)
-        return {
-            "num_trials": num_simulations,
-            "survival_probability_percent": max(94.0, p_survival),
-            "killzone_radius_m": 500.0,
-            "warning_perimeter_m": 1500.0,
-            "early_detection_m": 3500.0,
-            "recommended_loadout": {
-                "ANVIL_INTERCEPTORS": 4,
-                "DIRECTIONAL_JAMMER": 1,
-                "GNSS_SPOOFER": 1,
-                "SWIR_DAZZLER": 1
-            },
-            "mean_neutralization_sec": 3.7,
-            "status": "MISSION_READINESS_OPTIMAL"
-        }
-
-    def get_mission_kpis(self) -> Dict[str, Any]:
-        """Returns post-mission debriefing KPI metrics."""
-        return {
-            "total_frames": self.flight_recorder.total_frames(),
-            "defense_success_rate": 98.6,
-            "threats_neutralized": max(8, self.neutralized_count),
-            "kinetic_hit_accuracy": 96.4,
-            "mean_response_time_sec": 3.4,
-            "ledger_integrity_verified": True,
-            "hash_head": self.audit.chain[-1]["block_hash"] if self.audit.chain else "0" * 64
-        }
-
 
 # ============================================================================
-# 3. FASTAPI APPLICATION & REST / WEBSOCKET ENDPOINTS
+# 4. FASTAPI ROUTES & WEBSOCKET TELEMETRY
 # ============================================================================
 
+cuda_compute = CudaTacticalComputeEngine()
 audit_ledger = LatticeAuditLedger()
-engine = TacticalBattlespaceEngine(audit_ledger)
+mission_engine = LatticeMissionAutonomyEngine(cuda_compute, audit_ledger)
 
 
-class CountermeasureRequest(BaseModel):
+class EffectorCmd(BaseModel):
     effector: str = Field(default="RF_JAMMER")
-    target_id: Optional[str] = Field(default=None)
-    operator: str = Field(default="LATTICE_WEB_C2")
+    target_id: Optional[str] = None
+    operator: str = Field(default="HOTL_COMMANDER")
 
 
-class ScenarioRequest(BaseModel):
+class PlayCmd(BaseModel):
+    play_id: str
+    operator: str = Field(default="HOTL_COMMANDER")
+
+
+class PhaseCmd(BaseModel):
+    phase: str  # PRE_MISSION, LIVE_EXECUTION, POST_MISSION
+
+
+class ReplayCmd(BaseModel):
+    frame_index: Optional[int] = None
+    playing: Optional[bool] = None
+    speed: Optional[int] = None
+
+
+class ScenarioCmd(BaseModel):
     scenario: str
+    killzone_m: Optional[float] = None
+    warning_m: Optional[float] = None
 
 
-class SelectTargetRequest(BaseModel):
+class SelectCmd(BaseModel):
     target_id: str
 
 
-class RoeModeRequest(BaseModel):
+class RoeCmd(BaseModel):
     roe_mode: str
-
-
-class AutonomyPlayRequest(BaseModel):
-    play_type: str
-    target_ids: Optional[List[str]] = None
-
-
-class MissionPhaseRequest(BaseModel):
-    phase: str
 
 
 @asynccontextmanager
@@ -1078,7 +1186,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="CUAS v6.0-MONOLITH // Autonomous Counter-Swarm Command System",
+    title="LATTICE-MONOLITH // CUDA Monochrome Autonomous Counter-UAS C2",
     version="6.0.0-MONOLITH",
     lifespan=lifespan,
 )
@@ -1093,87 +1201,90 @@ app.add_middleware(
 
 @app.get("/api/v1/status")
 @app.get("/api/v1/telemetry")
-async def get_tactical_telemetry():
-    return JSONResponse(engine.get_snapshot())
+async def api_telemetry():
+    return JSONResponse(mission_engine.build_snapshot())
 
 
 @app.post("/api/v1/countermeasures/engage")
-async def engage_countermeasure(req: CountermeasureRequest):
+async def api_engage_effector(cmd: EffectorCmd):
     return JSONResponse(
-        engine.engage_countermeasure(req.effector, req.target_id, req.operator)
+        mission_engine.engage_single_effector(cmd.effector, cmd.target_id, cmd.operator)
     )
 
 
 @app.post("/api/v1/countermeasures/disengage")
-async def disengage_countermeasures():
-    return JSONResponse(engine.disengage_all())
+async def api_disengage():
+    return JSONResponse(mission_engine.ceasefire_and_rtb())
 
 
 @app.post("/api/v1/autonomy/play")
-async def execute_autonomy_play(req: AutonomyPlayRequest):
-    return JSONResponse(engine.execute_autonomy_play(req.play_type, req.target_ids))
-
-
-@app.post("/api/v1/autonomy/governance")
-async def set_autonomy_governance(req: RoeModeRequest):
-    engine.roe_mode = "FULL_AUTONOMOUS_ROE" if "AUTO" in req.roe_mode.upper() else "HOTL_SUPERVISED"
-    audit_ledger.record_event("AUTONOMY_GOVERNANCE_UPDATED", "LATTICE_WEB_C2", {"governance": engine.roe_mode})
-    return JSONResponse({"governance_mode": engine.roe_mode})
+async def api_autonomy_play(cmd: PlayCmd):
+    return JSONResponse(
+        mission_engine.execute_autonomy_play(cmd.play_id, cmd.operator)
+    )
 
 
 @app.post("/api/v1/mission/phase")
-async def set_mission_phase(req: MissionPhaseRequest):
-    if req.phase in ["PRE_MISSION", "LIVE_EXECUTION", "POST_MISSION"]:
-        engine.mission_phase = req.phase
-        audit_ledger.record_event("MISSION_PHASE_CHANGED", "LATTICE_WEB_C2", {"phase": req.phase})
-    return JSONResponse({"mission_phase": engine.mission_phase})
+async def api_mission_phase(cmd: PhaseCmd):
+    phase = cmd.phase.upper()
+    if phase in ("PRE_MISSION", "LIVE_EXECUTION", "POST_MISSION"):
+        mission_engine.mission_phase = phase
+        if phase == "POST_MISSION":
+            mission_engine.replay_index = 0
+            mission_engine.replay_playing = True
+        audit_ledger.record_event(
+            "MISSION_PHASE_TRANSITION", "HOTL_COMMANDER", {"phase": phase}
+        )
+    return JSONResponse({"mission_phase": mission_engine.mission_phase})
 
 
-@app.post("/api/v1/mission/wargame")
-async def run_wargame():
-    return JSONResponse(engine.run_pre_mission_wargame())
-
-
-@app.get("/api/v1/mission/replay")
-async def get_replay_frame(frame: int = Query(default=0)):
-    f = engine.flight_recorder.get_frame(frame)
-    if f is None:
-        return JSONResponse({"error": "No frames available"}, status_code=404)
-    return JSONResponse(f)
-
-
-@app.get("/api/v1/mission/kpis")
-async def get_mission_kpis():
-    return JSONResponse(engine.get_mission_kpis())
-
-
-@app.get("/api/v1/cuda/telemetry")
-async def get_cuda_telemetry():
-    return JSONResponse(engine.cuda_engine.get_telemetry())
+@app.post("/api/v1/mission/replay")
+async def api_mission_replay(cmd: ReplayCmd):
+    if cmd.frame_index is not None and mission_engine.recorded_frames:
+        mission_engine.replay_index = max(
+            0, min(cmd.frame_index, len(mission_engine.recorded_frames) - 1)
+        )
+    if cmd.playing is not None:
+        mission_engine.replay_playing = cmd.playing
+    if cmd.speed is not None and cmd.speed in (1, 2, 4):
+        mission_engine.replay_speed = cmd.speed
+    return JSONResponse(
+        {
+            "replay_index": mission_engine.replay_index,
+            "replay_playing": mission_engine.replay_playing,
+            "replay_speed": mission_engine.replay_speed,
+        }
+    )
 
 
 @app.post("/api/v1/scenario")
-async def switch_scenario(req: ScenarioRequest):
-    engine.load_scenario(req.scenario)
-    return JSONResponse({"status": "OK", "scenario": engine.scenario})
+async def api_scenario(cmd: ScenarioCmd):
+    if cmd.killzone_m is not None:
+        mission_engine.killzone_radius_m = max(200.0, min(1200.0, cmd.killzone_m))
+    if cmd.warning_m is not None:
+        mission_engine.warning_radius_m = max(800.0, min(2500.0, cmd.warning_m))
+    mission_engine.load_scenario(cmd.scenario)
+    return JSONResponse({"status": "OK", "scenario": mission_engine.scenario})
 
 
 @app.post("/api/v1/target/select")
-async def select_target(req: SelectTargetRequest):
-    if req.target_id in engine.tracks:
-        engine.selected_target_id = req.target_id
-    return JSONResponse({"selected_target_id": engine.selected_target_id})
+async def api_select_target(cmd: SelectCmd):
+    if cmd.target_id in mission_engine.entities:
+        mission_engine.selected_target_id = cmd.target_id
+    return JSONResponse({"selected_target_id": mission_engine.selected_target_id})
 
 
 @app.post("/api/v1/roe_mode")
-async def set_roe_mode(req: RoeModeRequest):
-    engine.roe_mode = (
-        "FULL_AUTONOMOUS_ROE" if "AUTO" in req.roe_mode.upper() else "HOTL_SUPERVISED"
+async def api_roe_mode(cmd: RoeCmd):
+    mission_engine.roe_mode = (
+        "FULL_AUTONOMOUS_ROE"
+        if cmd.roe_mode.upper() == "FULL_AUTONOMOUS_ROE"
+        else "HOTL_SUPERVISED"
     )
     audit_ledger.record_event(
-        "ROE_POSTURE_UPDATED", "LATTICE_WEB_C2", {"roe_mode": engine.roe_mode}
+        "ROE_GOVERNANCE_UPDATED", "HOTL_COMMANDER", {"roe_mode": mission_engine.roe_mode}
     )
-    return JSONResponse({"roe_mode": engine.roe_mode})
+    return JSONResponse({"roe_mode": mission_engine.roe_mode})
 
 
 @app.get("/api/v1/audit/logs")
@@ -1187,12 +1298,12 @@ async def verify_audit_chain():
 
 
 @app.websocket("/ws/telemetry")
-async def websocket_telemetry(ws: WebSocket):
+async def ws_telemetry(ws: WebSocket):
     await ws.accept()
     try:
         while True:
-            await ws.send_json(engine.get_snapshot())
-            await asyncio.sleep(0.05)
+            await ws.send_json(mission_engine.build_snapshot())
+            await asyncio.sleep(0.08)
     except WebSocketDisconnect:
         pass
     except Exception:
@@ -1200,31 +1311,32 @@ async def websocket_telemetry(ws: WebSocket):
 
 
 # ============================================================================
-# 4. 1000% ACHROMATIC MONOCHROME FULL-BLEED SPATIAL UI (LATTICE OS v6.0)
+# 5. 100% BLACK-AND-WHITE MONOCHROME ANDURIL LATTICE MISSION AUTONOMY UI
 # ============================================================================
 
-MONOLITH_SPATIAL_HTML = r"""<!DOCTYPE html>
+MONOCHROME_LATTICE_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>CUAS v6.0-MONOLITH // Autonomous Counter-Swarm Command System</title>
+<title>LATTICE // MISSION AUTONOMY C2 [MONOCHROME CUDA OS]</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
+  /* STRICT 100% ACHROMATIC BLACK & WHITE PALETTE — ZERO RGB / NEON COLORS */
   :root {
     --void: #000000;
-    --canvas-bg: #030303;
-    --panel-bg: rgba(10, 10, 10, 0.88);
-    --panel-border: #262626;
-    --hairline: #1C1C1C;
-    --text-bright: #FFFFFF;
-    --text-mid: #A3A3A3;
-    --text-dim: #737373;
-    --text-faint: #404040;
-    --alert-bg: #FFFFFF;
-    --alert-fg: #000000;
+    --surface: #070707;
+    --card: #0F0F0F;
+    --elevated: #171717;
+    --border-dim: #262626;
+    --border-mid: #404040;
+    --border-bright: #737373;
+    --white: #FFFFFF;
+    --silver: #D4D4D4;
+    --gray: #8A8A8A;
+    --dim: #525252;
   }
 
   * {
@@ -1239,9 +1351,9 @@ MONOLITH_SPATIAL_HTML = r"""<!DOCTYPE html>
     height: 100vh;
     overflow: hidden;
     background: var(--void);
-    color: var(--text-bright);
+    color: var(--white);
     font-family: 'Inter', sans-serif;
-    font-size: 11.5px;
+    font-size: 11px;
     -webkit-font-smoothing: antialiased;
   }
 
@@ -1250,1063 +1362,1274 @@ MONOLITH_SPATIAL_HTML = r"""<!DOCTYPE html>
     font-variant-numeric: tabular-nums;
   }
 
-  /* 1. FULL-BLEED 100VW x 100VH INTERACTIVE 3D BATTLESPACE CANVAS */
-  #battlespaceCanvas {
-    position: fixed;
-    inset: 0;
+  /* MASTER 100VH GRID */
+  .monolith-shell {
+    display: grid;
+    grid-template-rows: 46px calc(100vh - 46px);
     width: 100vw;
     height: 100vh;
-    z-index: 1;
-    cursor: grab;
-  }
-  #battlespaceCanvas:active {
-    cursor: grabbing;
+    background: var(--void);
   }
 
-  .tactical-vignette {
-    position: fixed;
-    inset: 0;
-    z-index: 2;
-    pointer-events: none;
-    background: radial-gradient(circle at 50% 50%, transparent 60%, rgba(0, 0, 0, 0.85) 100%);
-  }
-
-  /* SVG DYNAMIC LEADER LINE LAYER */
-  #leaderSvg {
-    position: fixed;
-    inset: 0;
-    width: 100vw;
-    height: 100vh;
-    z-index: 5;
-    pointer-events: none;
-  }
-
-  /* GLASSMORHPIC CHAMFERED PODS (Z-INDEX: 10) */
-  .hud-pod {
-    position: fixed;
-    z-index: 10;
-    background: var(--panel-bg);
-    border: 1px solid var(--panel-border);
-    backdrop-filter: blur(14px);
-    border-radius: 2px;
-    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.95);
-    transition: opacity 0.2s ease, transform 0.2s ease;
-  }
-
-  /* TOP NAVIGATION RIBBON */
-  #topNavPod {
-    top: 14px;
-    left: 14px;
-    right: 14px;
-    height: 48px;
+  /* TOP TACTICAL COMMAND RIBBON */
+  .top-ribbon {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: 0 16px;
+    padding: 0 12px;
+    background: #050505;
+    border-bottom: 1px solid var(--border-mid);
   }
 
-  .brand-group {
+  .brand-cluster {
     display: flex;
     align-items: center;
-    gap: 12px;
+    gap: 10px;
   }
+
+  .monolith-emblem {
+    width: 24px;
+    height: 24px;
+    border: 1.5px solid var(--white);
+    display: grid;
+    place-items: center;
+    background: #111111;
+  }
+
   .brand-title {
     font-family: 'Chakra Petch', sans-serif;
-    font-size: 14px;
+    font-size: 13px;
     font-weight: 700;
-    letter-spacing: 2.5px;
-    color: var(--text-bright);
-  }
-  .brand-tag {
-    font-size: 9px;
-    font-weight: 700;
-    padding: 2px 6px;
-    border: 1px solid var(--text-dim);
-    color: var(--text-dim);
-    border-radius: 2px;
+    letter-spacing: 2px;
+    color: var(--white);
   }
 
-  /* MISSION PHASE TABS */
+  /* CLOSED-LOOP LIFECYCLE TABS */
   .phase-tabs {
     display: flex;
-    gap: 6px;
-    background: #000000;
-    padding: 3px;
-    border: 1px solid var(--panel-border);
-    border-radius: 2px;
+    border: 1px solid var(--border-mid);
+    background: #0A0A0A;
   }
+
   .phase-tab {
-    padding: 5px 12px;
-    font-family: 'JetBrains Mono', monospace;
-    font-size: 10px;
-    font-weight: 600;
-    color: var(--text-dim);
+    padding: 5px 10px;
     background: transparent;
-    border: 1px solid transparent;
-    cursor: pointer;
-    transition: all 0.15s ease;
-  }
-  .phase-tab:hover {
-    color: var(--text-bright);
-  }
-  .phase-tab.active {
-    background: #FFFFFF;
-    color: #000000;
-    font-weight: 700;
-    border-color: #FFFFFF;
-  }
-
-  .nav-right {
-    display: flex;
-    align-items: center;
-    gap: 14px;
-  }
-  .gpu-badge {
-    display: flex;
-    align-items: center;
-    gap: 6px;
+    border: none;
+    border-right: 1px solid var(--border-dim);
+    color: var(--gray);
     font-family: 'JetBrains Mono', monospace;
-    font-size: 10px;
-    padding: 4px 10px;
-    border: 1px solid #333333;
-    background: #0F0F0F;
-  }
-  .defcon-badge {
-    font-family: 'JetBrains Mono', monospace;
-    font-size: 10px;
-    font-weight: 700;
-    padding: 4px 10px;
-    background: #FFFFFF;
-    color: #000000;
-    border: 1px solid #FFFFFF;
-    letter-spacing: 1px;
-  }
-
-  /* LEFT TRACKS POD */
-  #leftTracksPod {
-    top: 72px;
-    left: 14px;
-    width: 320px;
-    bottom: 84px;
-    display: flex;
-    flex-direction: column;
-    padding: 12px;
-  }
-  .pod-title {
-    font-family: 'Chakra Petch', sans-serif;
-    font-size: 11px;
-    font-weight: 700;
-    letter-spacing: 1.5px;
-    color: var(--text-dim);
-    border-bottom: 1px solid var(--hairline);
-    padding-bottom: 6px;
-    margin-bottom: 8px;
-    display: flex;
-    justify-content: space-between;
-  }
-  .track-list {
-    flex: 1;
-    overflow-y: auto;
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-  }
-  .track-card {
-    background: #0D0D0D;
-    border: 1px solid var(--panel-border);
-    padding: 8px 10px;
-    cursor: pointer;
-    transition: all 0.15s ease;
-  }
-  .track-card:hover {
-    border-color: #555555;
-    background: #141414;
-  }
-  .track-card.active {
-    border-color: #FFFFFF;
-    background: #1A1A1A;
-  }
-  .track-card-header {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    margin-bottom: 4px;
-  }
-  .target-id {
-    font-family: 'JetBrains Mono', monospace;
-    font-weight: 700;
-    font-size: 11px;
-  }
-  .threat-pill {
-    font-family: 'JetBrains Mono', monospace;
-    font-size: 9px;
-    font-weight: 700;
-    padding: 1px 5px;
-    background: #000000;
-    border: 1px solid #FFFFFF;
-    color: #FFFFFF;
-  }
-  .threat-pill.inverted {
-    background: #FFFFFF;
-    color: #000000;
-  }
-  .track-card-body {
-    display: flex;
-    justify-content: space-between;
-    font-size: 10px;
-    color: var(--text-mid);
-    font-family: 'JetBrains Mono', monospace;
-  }
-
-  /* RIGHT TARGET DETAIL HUD POD */
-  #rightDetailPod {
-    top: 72px;
-    right: 14px;
-    width: 360px;
-    bottom: 84px;
-    display: flex;
-    flex-direction: column;
-    padding: 14px;
-    overflow-y: auto;
-  }
-  .detail-row {
-    display: flex;
-    justify-content: space-between;
-    padding: 5px 0;
-    border-bottom: 1px solid var(--hairline);
-    font-family: 'JetBrains Mono', monospace;
-    font-size: 10.5px;
-  }
-  .detail-key {
-    color: var(--text-dim);
-  }
-  .detail-val {
-    color: var(--text-bright);
+    font-size: 9.5px;
     font-weight: 600;
+    cursor: pointer;
+    letter-spacing: 0.6px;
   }
-  .imm-bar-container {
-    margin: 8px 0;
-    background: #000000;
-    border: 1px solid var(--panel-border);
-    padding: 6px;
+  .phase-tab:last-child { border-right: none; }
+  .phase-tab:hover { color: var(--white); background: #141414; }
+  .phase-tab.active {
+    background: var(--white);
+    color: var(--void);
+    font-weight: 700;
   }
-  .imm-bar-row {
+
+  .center-controls {
     display: flex;
     align-items: center;
     gap: 8px;
-    margin-bottom: 4px;
+  }
+
+  /* INVERTED HIGH-CONTRAST DEFCON ALERT BLOCK */
+  .defcon-inverted {
+    padding: 4px 12px;
+    background: var(--white);
+    color: var(--void);
+    font-family: 'Chakra Petch', sans-serif;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 1.3px;
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    animation: invertPulse 1.4s infinite;
+  }
+
+  @keyframes invertPulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.72; }
+  }
+
+  .blink-sq {
+    width: 7px;
+    height: 7px;
+    background: var(--void);
+  }
+
+  .bw-select, .bw-btn {
+    background: #0D0D0D;
+    color: var(--white);
+    border: 1px solid var(--border-mid);
+    padding: 4px 9px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 9.5px;
+    cursor: pointer;
+  }
+  .bw-select:hover, .bw-btn:hover {
+    border-color: var(--white);
+    background: #1A1A1A;
+  }
+
+  .cuda-pill {
+    padding: 4px 9px;
+    background: #0C0C0C;
+    border: 1px solid var(--border-bright);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 9.5px;
+    color: var(--silver);
+  }
+
+  /* 3-COLUMN TACTICAL WORKSPACE (27% | 46% | 27%) */
+  .workspace-grid {
+    display: grid;
+    grid-template-columns: 27% 46% 27%;
+    gap: 6px;
+    padding: 6px;
+    height: 100%;
+    min-height: 0;
+  }
+
+  .col-stack {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    height: 100%;
+    min-height: 0;
+  }
+
+  /* CHAMFERED MONOCHROME TACTICAL PANEL */
+  .tac-panel {
+    background: var(--surface);
+    border: 1px solid var(--border-dim);
+    clip-path: polygon(
+      0 8px, 8px 0,
+      calc(100% - 8px) 0, 100% 8px,
+      100% calc(100% - 8px), calc(100% - 8px) 100%,
+      8px 100%, 0 calc(100% - 8px)
+    );
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    position: relative;
+  }
+
+  .panel-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 5px 10px;
+    background: #0D0D0D;
+    border-bottom: 1px solid var(--border-dim);
+    flex-shrink: 0;
+  }
+
+  .panel-title {
+    font-family: 'Chakra Petch', sans-serif;
+    font-size: 10.5px;
+    font-weight: 700;
+    letter-spacing: 1.4px;
+    text-transform: uppercase;
+    color: var(--white);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .panel-tag {
     font-family: 'JetBrains Mono', monospace;
     font-size: 9px;
+    padding: 1px 5px;
+    border: 1px solid var(--border-mid);
+    color: var(--silver);
+    background: #050505;
   }
-  .imm-bar-outer {
+
+  .canvas-box {
     flex: 1;
-    height: 6px;
-    background: #141414;
-    border: 1px solid #2B2B2B;
-    overflow: hidden;
-  }
-  .imm-bar-fill {
-    height: 100%;
-    background: #FFFFFF;
-  }
-
-  /* FLIR MONOCHROME CANVAS */
-  #flirCanvas {
+    position: relative;
     width: 100%;
-    height: 140px;
+    height: 100%;
+    min-height: 0;
     background: #000000;
-    border: 1px solid var(--panel-border);
-    margin: 8px 0;
   }
 
-  /* EFFECTOR BUTTONS */
-  .effector-grid {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 6px;
-    margin-top: 8px;
+  canvas {
+    display: block;
+    width: 100%;
+    height: 100%;
   }
-  .eff-btn {
-    padding: 8px 6px;
+
+  .panel-foot {
+    display: flex;
+    justify-content: space-between;
+    padding: 4px 10px;
+    background: #050505;
+    border-top: 1px solid var(--border-dim);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 9px;
+    color: var(--gray);
+    flex-shrink: 0;
+  }
+
+  /* LEFT COLUMN */
+  .optronic-box { flex: 0 0 53%; }
+  .spectrogram-box { flex: 1; }
+
+  /* CENTER COLUMN */
+  .swarm-matrix-box { flex: 0 0 18%; }
+  .ppi-scope-box { flex: 1; }
+  .timeline-box { flex: 0 0 11%; }
+
+  /* SWARM CLUSTER THREAT TABLE */
+  .matrix-scroll {
+    flex: 1;
+    overflow-y: auto;
+  }
+  .matrix-scroll::-webkit-scrollbar { width: 3px; }
+  .matrix-scroll::-webkit-scrollbar-thumb { background: var(--white); }
+
+  table.swarm-tbl {
+    width: 100%;
+    border-collapse: collapse;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 9.5px;
+  }
+  .swarm-tbl th {
+    position: sticky;
+    top: 0;
+    background: #0A0A0A;
+    color: var(--gray);
+    text-align: left;
+    padding: 4px 8px;
+    border-bottom: 1px solid var(--border-dim);
+    font-size: 8.5px;
+  }
+  .swarm-tbl td {
+    padding: 4px 8px;
+    border-bottom: 1px solid #161616;
+    cursor: pointer;
+  }
+  .swarm-tbl tr:hover { background: #141414; }
+  .swarm-tbl tr.sel-row {
+    background: #1F1F1F;
+    outline: 1px solid var(--white);
+  }
+
+  /* HOTL APPROVAL BANNER OVER RADAR */
+  .hotl-banner {
+    position: absolute;
+    bottom: 10px;
+    left: 10px;
+    right: 10px;
+    background: var(--white);
+    color: var(--void);
+    padding: 6px 10px;
+    display: none;
+    align-items: center;
+    justify-content: space-between;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+    font-weight: 700;
+    z-index: 5;
+    border: 1px solid var(--void);
+  }
+
+  .hotl-approve-btn {
+    background: var(--void);
+    color: var(--white);
+    border: 1px solid var(--void);
+    padding: 4px 10px;
     font-family: 'JetBrains Mono', monospace;
     font-size: 9.5px;
     font-weight: 700;
-    background: #121212;
-    color: #FFFFFF;
-    border: 1px solid #333333;
     cursor: pointer;
-    transition: all 0.15s ease;
-    text-align: center;
   }
-  .eff-btn:hover {
-    background: #242424;
-    border-color: #FFFFFF;
-  }
-  .eff-btn.danger {
-    background: #FFFFFF;
-    color: #000000;
-    border-color: #FFFFFF;
-  }
-  .eff-btn.danger:hover {
-    background: #D4D4D4;
+  .hotl-approve-btn:hover {
+    background: #262626;
   }
 
-  /* CENTER BOTTOM AUTONOMY PLAYBOOK POD */
-  #bottomAutonomyPod {
-    bottom: 14px;
-    left: 344px;
-    right: 388px;
-    height: 60px;
+  /* CLOSED-LOOP TIMELINE SCRUBBER */
+  .timeline-controls {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 10px;
+    flex: 1;
+  }
+
+  input[type="range"].bw-slider {
+    flex: 1;
+    accent-color: #FFFFFF;
+    cursor: pointer;
+    height: 4px;
+    background: #262626;
+  }
+
+  /* RIGHT COLUMN */
+  .pip-zoom-box { flex: 0 0 36%; }
+  .autonomy-dock-box { flex: 0 0 45%; }
+  .audit-ledger-box { flex: 1; }
+
+  .play-list {
+    padding: 6px 9px;
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+    flex: 1;
+    justify-content: space-between;
+  }
+
+  .play-card {
+    background: var(--card);
+    border: 1px solid var(--border-mid);
+    padding: 6px 9px;
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: 0 16px;
-  }
-  .play-buttons {
-    display: flex;
-    gap: 8px;
-  }
-  .play-btn {
-    padding: 6px 14px;
-    font-family: 'JetBrains Mono', monospace;
-    font-size: 10px;
-    font-weight: 700;
-    background: #111111;
-    color: #FFFFFF;
-    border: 1px solid #333333;
     cursor: pointer;
-    transition: all 0.15s ease;
+    color: var(--white);
+    text-align: left;
+    transition: all 0.1s ease;
   }
-  .play-btn:hover {
-    border-color: #FFFFFF;
+  .play-card:hover {
+    background: var(--elevated);
+    border-color: var(--white);
   }
-  .play-btn.active {
-    background: #FFFFFF;
-    color: #000000;
-    border-color: #FFFFFF;
+  .play-card.active-play {
+    background: var(--white);
+    color: var(--void);
+    border-color: var(--white);
   }
 
-  .hotl-intent-banner {
-    position: fixed;
-    top: 70px;
-    left: 50%;
-    transform: translateX(-50%);
-    background: #0A0A0A;
-    border: 2px solid #FFFFFF;
-    padding: 10px 20px;
-    z-index: 100;
-    display: none;
-    align-items: center;
-    gap: 16px;
-    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.95);
+  .play-title {
+    font-family: 'Chakra Petch', sans-serif;
+    font-size: 10.5px;
+    font-weight: 700;
+    letter-spacing: 0.7px;
   }
-  .intent-text {
+  .play-desc {
     font-family: 'JetBrains Mono', monospace;
-    font-size: 11px;
-    font-weight: 600;
+    font-size: 8.5px;
+    opacity: 0.75;
+    margin-top: 1px;
   }
 
-  /* PRE-MISSION & POST-MISSION OVERLAYS */
-  .view-container {
-    position: fixed;
-    inset: 72px 14px 14px 14px;
-    z-index: 20;
-    background: rgba(4, 4, 4, 0.96);
-    border: 1px solid var(--panel-border);
-    padding: 24px;
+  .toggle-pill {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 8.5px;
+    padding: 2px 6px;
+    border: 1px solid currentColor;
+    font-weight: 700;
+  }
+
+  .audit-scroll {
+    padding: 5px 9px;
+    overflow-y: auto;
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 8.5px;
+  }
+
+  .audit-item {
+    display: flex;
+    justify-content: space-between;
+    padding: 3px 6px;
+    background: #0C0C0C;
+    border-left: 2px solid var(--white);
+    color: var(--silver);
+  }
+
+  /* PRE-MISSION WARGAMING MODAL OVERLAY */
+  .premission-drawer {
+    position: absolute;
+    top: 8px;
+    left: 8px;
+    right: 8px;
+    background: rgba(5, 5, 5, 0.94);
+    border: 1px solid var(--white);
+    padding: 10px 12px;
+    z-index: 6;
     display: none;
     flex-direction: column;
-    overflow-y: auto;
-  }
-
-  /* TIMELINE SCRUBBER IN POST-MISSION */
-  .scrubber-panel {
-    background: #0A0A0A;
-    border: 1px solid var(--panel-border);
-    padding: 16px;
-    margin-top: 20px;
-  }
-  .scrubber-slider {
-    width: 100%;
-    margin: 12px 0;
-    accent-color: #FFFFFF;
-  }
-  .scrubber-controls {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    font-family: 'JetBrains Mono', monospace;
-  }
-
-  /* KPI GRID */
-  .kpi-grid {
-    display: grid;
-    grid-template-columns: repeat(4, 1fr);
-    gap: 16px;
-    margin-top: 20px;
-  }
-  .kpi-box {
-    background: #0E0E0E;
-    border: 1px solid var(--panel-border);
-    padding: 18px;
-    text-align: center;
-  }
-  .kpi-val {
-    font-family: 'JetBrains Mono', monospace;
-    font-size: 26px;
-    font-weight: 700;
-    color: #FFFFFF;
-    margin-bottom: 6px;
-  }
-  .kpi-lbl {
-    font-size: 10px;
-    color: var(--text-dim);
-    letter-spacing: 1px;
+    gap: 8px;
   }
 </style>
 </head>
 <body>
-
-<!-- 1. FULL-BLEED 3D BATTLESPACE CANVAS -->
-<canvas id="battlespaceCanvas"></canvas>
-<div class="tactical-vignette"></div>
-<svg id="leaderSvg"><line id="tetherLine" stroke="#FFFFFF" stroke-width="1.2" stroke-dasharray="3,3" opacity="0.8"/></svg>
-
-<!-- 2. TOP NAVIGATION RIBBON -->
-<div id="topNavPod" class="hud-pod">
-  <div class="brand-group">
-    <div class="brand-title">MONOLITH-CUAS // C2</div>
-    <div class="brand-tag">v6.0-AUTONOMY</div>
-  </div>
-
-  <div class="phase-tabs">
-    <button class="phase-tab" id="tabPreMission" onclick="setMissionPhase('PRE_MISSION')">[1] PRE-MISSION MODEL</button>
-    <button class="phase-tab active" id="tabLiveExecution" onclick="setMissionPhase('LIVE_EXECUTION')">[2] LIVE EXECUTION</button>
-    <button class="phase-tab" id="tabPostMission" onclick="setMissionPhase('POST_MISSION')">[3] POST-MISSION DEBRIEF</button>
-  </div>
-
-  <div class="nav-right">
-    <div class="gpu-badge mono" id="gpuTelemetryBadge">GPU: NVIDIA RTX 3050 | VRAM: 3.8GB</div>
-    <div class="defcon-badge" id="defconBadge">DEFCON 1 // CRITICAL INTRUSION</div>
-    <div class="mono" id="clockUtc" style="color: var(--text-mid); font-size: 11px;">00:00:00 UTC</div>
-  </div>
-</div>
-
-<!-- 3. LEFT TRACKS POD -->
-<div id="leftTracksPod" class="hud-pod">
-  <div class="pod-title">
-    <span>AIRSPACE TRACKS</span>
-    <span class="mono" id="trackCountLabel">0 TRACKS</span>
-  </div>
-  <div class="track-list" id="trackList"></div>
-</div>
-
-<!-- 4. RIGHT TARGET DETAIL POD -->
-<div id="rightDetailPod" class="hud-pod">
-  <div class="pod-title">
-    <span>TARGET PROFILE // IMM-UKF</span>
-    <span class="mono" id="detailTargetId">#101-ALPHA</span>
-  </div>
-
-  <canvas id="flirCanvas"></canvas>
-
-  <div class="detail-row"><span class="detail-key">AFFILIATION</span><span class="detail-val" id="dAffiliation">HOSTILE</span></div>
-  <div class="detail-row"><span class="detail-key">DRONE CLASS</span><span class="detail-val" id="dClass">SUICIDE_FPV</span></div>
-  <div class="detail-row"><span class="detail-key">RF PROTOCOL</span><span class="detail-val" id="dRf">ExpressLRS 2.4GHz</span></div>
-  <div class="detail-row"><span class="detail-key">RANGE / BEARING</span><span class="detail-val" id="dRangeBearing">850m // 048° NE</span></div>
-  <div class="detail-row"><span class="detail-key">3D ENU POSITION</span><span class="detail-val" id="dEnu">(120.0, 840.0, 180.0)</span></div>
-  <div class="detail-row"><span class="detail-key">SPEED / CLOSING VEL</span><span class="detail-val" id="dSpeed">26.5 m/s // +22.0 m/s</span></div>
-  <div class="detail-row"><span class="detail-key">TIME-TO-IMPACT</span><span class="detail-val" id="dTti">5.2s (DIVE WARNING)</span></div>
-  <div class="detail-row"><span class="detail-key">KILL-CHAIN STAGE</span><span class="detail-val" id="dKillChain">ENGAGE (STAGE 5/6)</span></div>
-  <div class="detail-row"><span class="detail-key">OPTIMAL EFFECTOR</span><span class="detail-val" id="dWtaRec">KINETIC_INTERCEPTOR</span></div>
-
-  <div class="imm-bar-container">
-    <div style="font-size: 9px; font-weight: 700; color: var(--text-dim); margin-bottom: 6px;">IMM-UKF MARKOV MODE PROBABILITIES</div>
-    <div class="imm-bar-row"><span>CV</span><div class="imm-bar-outer"><div class="imm-bar-fill" id="barCv" style="width: 10%;"></div></div><span id="txtCv">0.10</span></div>
-    <div class="imm-bar-row"><span>CTRV</span><div class="imm-bar-outer"><div class="imm-bar-fill" id="barCtrv" style="width: 15%;"></div></div><span id="txtCtrv">0.15</span></div>
-    <div class="imm-bar-row"><span>CA_DIVE</span><div class="imm-bar-outer"><div class="imm-bar-fill" id="barDive" style="width: 75%;"></div></div><span id="txtDive">0.75</span></div>
-  </div>
-
-  <div style="font-size: 9.5px; font-weight: 700; color: var(--text-dim); margin-top: 10px;">MANUAL EFFECTOR OVERRIDE</div>
-  <div class="effector-grid">
-    <button class="eff-btn" onclick="engageEffector('RF_JAMMER')">ENGAGE RF JAMMER</button>
-    <button class="eff-btn" onclick="engageEffector('GNSS_SPOOFER')">GNSS SPOOF</button>
-    <button class="eff-btn" onclick="engageEffector('OPTICAL_DAZZLER')">OPTICAL DAZZLER</button>
-    <button class="eff-btn danger" onclick="engageEffector('KINETIC_INTERCEPTOR')">LAUNCH ANVIL</button>
-  </div>
-</div>
-
-<!-- 5. CENTER BOTTOM AUTONOMY PLAYBOOK POD -->
-<div id="bottomAutonomyPod" class="hud-pod">
-  <div style="display: flex; align-items: center; gap: 8px;">
-    <span class="mono" style="font-weight: 700; font-size: 10.5px;">AUTONOMY PLAY:</span>
-    <div class="play-buttons">
-      <button class="play-btn" id="btnPlay01" onclick="executeAutonomyPlay('PLAY_01_PERIMETER_CAP')">PLAY 01: CAP</button>
-      <button class="play-btn" id="btnPlay02" onclick="executeAutonomyPlay('PLAY_02_SWARM_EW_BARRIER')">PLAY 02: EW BARRIER</button>
-      <button class="play-btn" id="btnPlay03" onclick="executeAutonomyPlay('PLAY_03_KINETIC_WOLF_PACK')">PLAY 03: WOLF PACK</button>
-      <button class="play-btn" id="btnPlay04" onclick="executeAutonomyPlay('PLAY_04_CEASEFIRE_RTB')">PLAY 04: CEASEFIRE</button>
-    </div>
-  </div>
-
-  <div style="display: flex; align-items: center; gap: 10px;">
-    <span class="mono" style="font-size: 10px; color: var(--text-dim);">GOVERNANCE:</span>
-    <button class="play-btn active" id="btnGovernance" onclick="toggleGovernance()">HOTL_SUPERVISED</button>
-  </div>
-</div>
-
-<!-- 6. HOTL INTENT APPROVAL BANNER -->
-<div class="hotl-intent-banner" id="intentBanner">
-  <div class="intent-text" id="intentText">PROPOSED AUTONOMY PLAY: PLAY 03 KINETIC WOLF PACK (4 ANVIL SALVO)</div>
-  <button class="eff-btn danger" onclick="approveIntent()" style="padding: 6px 14px;">[APPROVE PLAY]</button>
-  <button class="eff-btn" onclick="vetoIntent()" style="padding: 6px 14px;">[VETO / ABORT]</button>
-</div>
-
-<!-- 7. PRE-MISSION MODEL OVERLAY -->
-<div class="view-container" id="preMissionView">
-  <div class="pod-title" style="font-size: 14px;">PRE-MISSION THREAT MODELING & DEFENSE WARGAMING</div>
-  <div style="color: var(--text-mid); font-size: 11px; margin-bottom: 20px;">
-    Configures defended perimeter geometry, simulates multi-axis swarm saturation, and validates survival probabilities.
-  </div>
-
-  <div class="kpi-grid">
-    <div class="kpi-box"><div class="kpi-val">500m</div><div class="kpi-lbl">INNER KILLZONE RADIUS</div></div>
-    <div class="kpi-box"><div class="kpi-val">1500m</div><div class="kpi-lbl">WARNING PERIMETER RADIUS</div></div>
-    <div class="kpi-box"><div class="kpi-val">3500m</div><div class="kpi-lbl">EARLY DETECTION BOUNDARY</div></div>
-    <div class="kpi-box"><div class="kpi-val" id="wargameSurvival">98.4%</div><div class="kpi-lbl">MONTE CARLO P(SURVIVAL)</div></div>
-  </div>
-
-  <div style="margin-top: 30px; display: flex; gap: 14px; align-items: center;">
-    <button class="eff-btn danger" onclick="runWargame()" style="padding: 10px 24px; font-size: 11px;">[RUN 500-TRIAL MONTE CARLO WARGAME]</button>
-    <span class="mono" id="wargameStatus" style="color: var(--text-dim); font-size: 11px;">Wargame engine ready.</span>
-  </div>
-</div>
-
-<!-- 8. POST-MISSION DEBRIEF OVERLAY -->
-<div class="view-container" id="postMissionView">
-  <div class="pod-title" style="font-size: 14px;">POST-MISSION DEBRIEFING & FLIGHT RECORDER REPLAY</div>
-
-  <div class="kpi-grid">
-    <div class="kpi-box"><div class="kpi-val" id="kpiSuccess">98.6%</div><div class="kpi-lbl">MISSION DEFENSE SUCCESS</div></div>
-    <div class="kpi-box"><div class="kpi-val" id="kpiNeutralized">8 / 8</div><div class="kpi-lbl">TARGETS SPLASHED</div></div>
-    <div class="kpi-box"><div class="kpi-val" id="kpiHitRate">96.4%</div><div class="kpi-lbl">ANVIL KINETIC HIT RATE</div></div>
-    <div class="kpi-box"><div class="kpi-val" id="kpiReaction">3.4s</div><div class="kpi-lbl">MEAN REACTION TIME</div></div>
-  </div>
-
-  <div class="scrubber-panel">
-    <div class="pod-title">TIMELINE SCRUBBER (3,600 FRAMES)</div>
-    <input type="range" min="0" max="100" value="0" class="scrubber-slider" id="timelineSlider" oninput="scrubTimeline(this.value)">
-    <div class="scrubber-controls">
-      <div style="display: flex; gap: 8px;">
-        <button class="eff-btn" onclick="stepFrame(-1)">◀ STEP</button>
-        <button class="eff-btn" id="btnPlayPause" onclick="togglePlayback()">▶ PLAY</button>
-        <button class="eff-btn" onclick="stepFrame(1)">STEP ▶</button>
+<div class="monolith-shell">
+  <!-- TOP COMMAND RIBBON -->
+  <header class="top-ribbon">
+    <div class="brand-cluster">
+      <div class="monolith-emblem">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#FFFFFF" stroke-width="2.2">
+          <polygon points="12 2 22 8.5 22 15.5 12 22 2 15.5 2 8.5 12 2"/>
+          <circle cx="12" cy="12" r="2.5" fill="#FFFFFF"/>
+        </svg>
       </div>
-      <div class="mono" id="scrubberInfo">FRAME #0 / 0 | TIME: 00:00.0 UTC</div>
-      <div style="display: flex; gap: 6px;">
-        <button class="eff-btn" onclick="setSpeed(0.5)">0.5x</button>
-        <button class="eff-btn" onclick="setSpeed(1.0)">1.0x</button>
-        <button class="eff-btn" onclick="setSpeed(2.0)">2.0x</button>
-        <button class="eff-btn" onclick="setSpeed(4.0)">4.0x</button>
+      <div>
+        <div class="brand-title">LATTICE // MISSION AUTONOMY</div>
+      </div>
+
+      <!-- CLOSED-LOOP MISSION LIFECYCLE SWITCHER -->
+      <div class="phase-tabs">
+        <button class="phase-tab" id="tabPRE" onclick="setMissionPhase('PRE_MISSION')">1. PRE-MISSION MODEL</button>
+        <button class="phase-tab active" id="tabLIVE" onclick="setMissionPhase('LIVE_EXECUTION')">2. LIVE EXECUTION</button>
+        <button class="phase-tab" id="tabPOST" onclick="setMissionPhase('POST_MISSION')">3. POST-MISSION DEBRIEF</button>
       </div>
     </div>
-  </div>
+
+    <div class="center-controls">
+      <div class="defcon-inverted">
+        <span class="blink-sq"></span>
+        <span id="defconText">DEFCON 1 // SWARM BREACH</span>
+      </div>
+
+      <select id="scenarioSelect" class="bw-select" onchange="changeScenario(this.value)">
+        <option value="PINCER_SWARM_10">SWARM: 8-UAV MULTI-AXIS PINCER</option>
+        <option value="RF_SILENT_STEALTH">SWARM: RF-SILENT STEALTH WAVE</option>
+        <option value="FPV_TERMINAL_DIVE">SWARM: FPV TERMINAL DIVE</option>
+      </select>
+
+      <button class="bw-btn" onclick="toggleRoeGovernance()">
+        GOVERNANCE: <strong id="roeText">HOTL SUPERVISED</strong>
+      </button>
+    </div>
+
+    <div style="display:flex;align-items:center;gap:8px;">
+      <div class="cuda-pill" id="cudaHudBadge">CUDA: INITIALIZING...</div>
+      <div class="cuda-pill" id="utcClock">00:00:00 UTC</div>
+    </div>
+  </header>
+
+  <!-- 3-COLUMN MONOCHROME TACTICAL WORKSPACE -->
+  <main class="workspace-grid">
+    <!-- LEFT COLUMN: EO/IR GIMBAL SENSOR + CUDA MICRO-DOPPLER SPECTROGRAM -->
+    <section class="col-stack">
+      <div class="tac-panel optronic-box">
+        <div class="panel-head">
+          <div class="panel-title">TACTICAL OPTRONIC SENSOR // LOCK-ON</div>
+          <div style="display:flex;gap:3px;">
+            <button class="bw-btn" id="btnWH" style="padding:2px 5px;background:#FFF;color:#000;" onclick="setPolar('WH')">W-HOT</button>
+            <button class="bw-btn" id="btnBH" style="padding:2px 5px;" onclick="setPolar('BH')">B-HOT</button>
+          </div>
+        </div>
+        <div class="canvas-box">
+          <canvas id="optronicCanvas"></canvas>
+        </div>
+        <div class="panel-foot">
+          <span id="optLockFoot">TGT LOCK: #TGT-101 | TTI: 14.2s</span>
+          <span>GPU FP16 // 31.8 FPS</span>
+        </div>
+      </div>
+
+      <div class="tac-panel spectrogram-box">
+        <div class="panel-head">
+          <div class="panel-title">CUDA MICRO-DOPPLER SPECTROGRAM</div>
+          <span class="panel-tag" id="rpmTag">14,400 RPM [STFT]</span>
+        </div>
+        <div class="canvas-box">
+          <canvas id="dopplerCanvas"></canvas>
+        </div>
+        <div class="panel-foot">
+          <span>ROTOR FREQUENCY (0 - 300 Hz)</span>
+          <span>TORCH.STFT CUDA</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- CENTER COLUMN: SWARM THREAT MATRIX + 360° PULSE-DOPPLER SCOPE + TIMELINE -->
+    <section class="col-stack">
+      <div class="tac-panel swarm-matrix-box">
+        <div class="panel-head">
+          <div class="panel-title">SWARM CLUSTER EVALUATION &amp; ASSET TASKING</div>
+          <span class="panel-tag" id="assetRatioTag">HOSTILE: 7 | FRIENDLY: 2 | SPLASH: 0</span>
+        </div>
+        <div class="matrix-scroll">
+          <table class="swarm-tbl">
+            <thead>
+              <tr>
+                <th>TARGET</th>
+                <th>CLUSTER</th>
+                <th>SPEED</th>
+                <th>RNG</th>
+                <th>TTI</th>
+                <th>TASKED ASSET</th>
+              </tr>
+            </thead>
+            <tbody id="swarmTableBody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="tac-panel ppi-scope-box">
+        <div class="panel-head">
+          <div class="panel-title">360° PULSE-DOPPLER &amp; MULTI-ASSET SWARM SCOPE</div>
+          <span class="panel-tag">37.7749°N, 122.4194°W // 500m / 1500m / 3500m</span>
+        </div>
+        <div class="canvas-box">
+          <canvas id="radarCanvas"></canvas>
+
+          <!-- PRE-MISSION THREAT MODELING DRAWER -->
+          <div class="premission-drawer" id="preMissionDrawer">
+            <div style="display:flex;justify-content:space-between;align-items:center;">
+              <strong style="font-family:'Chakra Petch';letter-spacing:1px;">PRE-MISSION THREAT MODELING &amp; GEOFENCE WARGAMING</strong>
+              <button class="bw-btn" style="background:#FFF;color:#000;font-weight:700;" onclick="setMissionPhase('LIVE_EXECUTION')">LAUNCH LIVE MISSION &rarr;</button>
+            </div>
+            <div style="display:flex;gap:12px;align-items:center;font-family:'JetBrains Mono';font-size:9.5px;">
+              <span>KILLZONE RADIUS: <strong id="kzVal">500m</strong></span>
+              <input type="range" min="300" max="1000" step="50" value="500" class="bw-slider" oninput="updateGeofencePreview(this.value)">
+              <span>MONTE CARLO P(SURVIVAL): <strong>98.4%</strong></span>
+            </div>
+          </div>
+
+          <!-- HOTL AUTONOMY INTENT APPROVAL BANNER -->
+          <div class="hotl-banner" id="hotlBanner">
+            <span id="hotlBannerText">AUTONOMY RECOMMENDATION: PLAY_03_KINETIC_WOLF_PACK</span>
+            <button class="hotl-approve-btn" onclick="approvePendingPlay()">APPROVE PLAY [ENTER]</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="tac-panel timeline-box">
+        <div class="panel-head">
+          <div class="panel-title">CLOSED-LOOP MISSION TIMELINE &amp; DEBRIEF SCRUBBER</div>
+          <span class="panel-tag" id="replayCounterTag">LIVE RECORDING // FRAME 0001</span>
+        </div>
+        <div class="timeline-controls">
+          <button class="bw-btn" id="playPauseBtn" onclick="toggleReplayPlay()">PAUSE</button>
+          <button class="bw-btn" id="speedBtn" onclick="cycleReplaySpeed()">1X</button>
+          <input type="range" id="timelineSlider" class="bw-slider" min="0" max="1" value="1" oninput="scrubTimeline(this.value)">
+          <button class="bw-btn" onclick="setMissionPhase('LIVE_EXECUTION')">LIVE</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- RIGHT COLUMN: PiP 4X FLIR TARGET ZOOM + AUTONOMY PLAYBOOK + SHA-256 AUDIT -->
+    <section class="col-stack">
+      <div class="tac-panel pip-zoom-box">
+        <div class="panel-head">
+          <div class="panel-title">PICTURE-IN-PICTURE TARGET ZOOM</div>
+          <span class="panel-tag" id="pipTargetTag">FLIR 4X // #TGT-101</span>
+        </div>
+        <div class="canvas-box">
+          <canvas id="pipCanvas"></canvas>
+        </div>
+        <div class="panel-foot">
+          <span id="pipOrdnanceFoot">THERMAL GRAIN // PAYLOAD POSITIVE</span>
+          <span id="pipRfFoot">RF: -72.1 dBm</span>
+        </div>
+      </div>
+
+      <div class="tac-panel autonomy-dock-box">
+        <div class="panel-head">
+          <div class="panel-title">HOTL AUTONOMY PLAYBOOK &amp; EFFECTORS</div>
+          <span class="panel-tag">KEYS [1-4]</span>
+        </div>
+        <div class="play-list">
+          <button class="play-card" id="cardPlay1" onclick="triggerPlay('PLAY_01_PERIMETER_CAP')">
+            <div>
+              <div class="play-title">[1] PLAY 01: PERIMETER ISR CAP</div>
+              <div class="play-desc">TASK FRIENDLY WINGMEN TO SHADOW CLUSTERS</div>
+            </div>
+            <span class="toggle-pill" id="stPlay1">STANDBY</span>
+          </button>
+
+          <button class="play-card" id="cardPlay2" onclick="triggerPlay('PLAY_02_SWARM_EW_BARRIER')">
+            <div>
+              <div class="play-title">[2] PLAY 02: SWARM EW BARRIER</div>
+              <div class="play-desc">SYNC RF JAMMER + GNSS SPOOF + SWIR DAZZLER</div>
+            </div>
+            <span class="toggle-pill" id="stPlay2">STANDBY</span>
+          </button>
+
+          <button class="play-card" id="cardPlay3" onclick="triggerPlay('PLAY_03_KINETIC_WOLF_PACK')">
+            <div>
+              <div class="play-title">[3] PLAY 03: KINETIC WOLF-PACK</div>
+              <div class="play-desc">DISPATCH ANVIL HARD-KILL INTERCEPTOR SWARM</div>
+            </div>
+            <span class="toggle-pill" id="stPlay3">8 SILOS</span>
+          </button>
+
+          <button class="play-card" id="cardSingleJam" onclick="triggerSingleJam()">
+            <div>
+              <div class="play-title">[4] SINGLE-TARGET RF + SPOOF LOCK</div>
+              <div class="play-desc">DIRECTED NON-KINETIC NEUTRALIZATION</div>
+            </div>
+            <span class="toggle-pill" id="stSingleJam">READY</span>
+          </button>
+
+          <button class="play-card" style="background:#141414;border-color:#FFFFFF;" onclick="triggerPlay('PLAY_04_CEASEFIRE_RTB')">
+            <div>
+              <div class="play-title">[SPACE] EMERGENCY CEASEFIRE &amp; RTB</div>
+              <div class="play-desc">DE-ENERGIZE EMITTERS &amp; RECALL WINGMEN</div>
+            </div>
+            <span class="toggle-pill">SAFE</span>
+          </button>
+        </div>
+      </div>
+
+      <div class="tac-panel audit-ledger-box">
+        <div class="panel-head">
+          <div class="panel-title">SHA-256 FORENSIC MISSION LEDGER</div>
+          <span class="panel-tag">VERIFIED</span>
+        </div>
+        <div class="audit-scroll" id="auditList"></div>
+      </div>
+    </section>
+  </main>
 </div>
 
 <script>
-  let telemetry = null;
-  let currentPhase = "LIVE_EXECUTION";
-  let governanceMode = "HOTL_SUPERVISED";
-  let selectedTargetId = "#101-ALPHA";
-  let playbackSpeed = 1.0;
-  let isPlaying = false;
-  let replayFrameIdx = 0;
+  let state = null;
+  let polarity = 'WH';
+  let screenPoints = {};
+  let tick = 0;
 
-  // 3D Canvas Perspective Parameters
-  const canvas = document.getElementById('battlespaceCanvas');
-  const ctx = canvas.getContext('2d');
-  let viewAngle = 45 * Math.PI / 180;
-  let viewPitch = 55 * Math.PI / 180;
-  let viewZoom = 0.22;
-  let isDragging = false;
-  let lastMouse = { x: 0, y: 0 };
-
-  function resizeCanvas() {
-    canvas.width = window.innerWidth;
-    canvas.height = window.innerHeight;
-  }
-  window.addEventListener('resize', resizeCanvas);
-  resizeCanvas();
-
-  // Mouse Orbit & Zoom Controls
-  window.addEventListener('mousedown', (e) => {
-    if (e.target.tagName !== 'BUTTON' && e.target.tagName !== 'INPUT' && !e.target.closest('.hud-pod')) {
-      isDragging = true;
-      lastMouse = { x: e.clientX, y: e.clientY };
-    }
-  });
-  window.addEventListener('mousemove', (e) => {
-    if (isDragging) {
-      const dx = e.clientX - lastMouse.x;
-      const dy = e.clientY - lastMouse.y;
-      viewAngle += dx * 0.005;
-      viewPitch = Math.max(0.15, Math.min(1.4, viewPitch + dy * 0.005));
-      lastMouse = { x: e.clientX, y: e.clientY };
-    }
-  });
-  window.addEventListener('mouseup', () => isDragging = false);
-  window.addEventListener('wheel', (e) => {
-    viewZoom = Math.max(0.08, Math.min(0.65, viewZoom - e.deltaY * 0.0003));
-  });
-
-  // Project 3D ENU Coordinates into 2D Screen
-  function project(east, north, alt) {
-    const cx = canvas.width / 2;
-    const cy = canvas.height / 2 + 40;
-
-    const cosA = Math.cos(viewAngle);
-    const sinA = Math.sin(viewAngle);
-    const rotX = east * cosA - north * sinA;
-    const rotY = east * sinA + north * cosA;
-
-    const cosP = Math.cos(viewPitch);
-    const sinP = Math.sin(viewPitch);
-    const scrX = cx + rotX * viewZoom;
-    const scrY = cy - (rotY * sinP - alt * cosP) * viewZoom;
-    const groundY = cy - (rotY * sinP) * viewZoom;
-
-    return { x: scrX, y: scrY, groundY: groundY, depth: rotY };
+  function setPolar(p) {
+    polarity = p;
+    document.getElementById('btnWH').style.background = p === 'WH' ? '#FFFFFF' : '#0D0D0D';
+    document.getElementById('btnWH').style.color = p === 'WH' ? '#000000' : '#FFFFFF';
+    document.getElementById('btnBH').style.background = p === 'BH' ? '#FFFFFF' : '#0D0D0D';
+    document.getElementById('btnBH').style.color = p === 'BH' ? '#000000' : '#FFFFFF';
   }
 
-  // Draw 100% Achromatic Monochrome 3D Battlespace
-  function render3dBattlespace() {
+  async function setMissionPhase(phase) {
+    await fetch('/api/v1/mission/phase', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({phase})
+    });
+  }
+
+  async function triggerPlay(playId) {
+    await fetch('/api/v1/autonomy/play', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({play_id: playId})
+    });
+  }
+
+  async function approvePendingPlay() {
+    if (state && state.pending_autonomy_play) {
+      await triggerPlay(state.pending_autonomy_play.play_id);
+    }
+  }
+
+  async function triggerSingleJam() {
+    const tid = state ? state.selected_target_id : null;
+    await fetch('/api/v1/countermeasures/engage', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({effector: 'RF_JAMMER', target_id: tid})
+    });
+  }
+
+  async function selectTrack(targetId) {
+    if (state) state.selected_target_id = targetId;
+    await fetch('/api/v1/target/select', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({target_id: targetId})
+    });
+  }
+
+  async function changeScenario(scenario) {
+    await fetch('/api/v1/scenario', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({scenario})
+    });
+  }
+
+  async function updateGeofencePreview(kz) {
+    document.getElementById('kzVal').textContent = kz + 'm';
+    await fetch('/api/v1/scenario', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({scenario: state ? state.scenario : 'PINCER_SWARM_10', killzone_m: Number(kz)})
+    });
+  }
+
+  async function toggleRoeGovernance() {
+    const next = (state && state.roe_mode === 'FULL_AUTONOMOUS_ROE') ? 'HOTL_SUPERVISED' : 'FULL_AUTONOMOUS_ROE';
+    await fetch('/api/v1/roe_mode', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({roe_mode: next})
+    });
+  }
+
+  async function toggleReplayPlay() {
+    if (!state) return;
+    if (state.mission_phase !== 'POST_MISSION') {
+      await setMissionPhase('POST_MISSION');
+      return;
+    }
+    await fetch('/api/v1/mission/replay', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({playing: !state.replay_playing})
+    });
+  }
+
+  async function cycleReplaySpeed() {
+    if (!state) return;
+    const next = state.replay_speed === 1 ? 2 : (state.replay_speed === 2 ? 4 : 1);
+    await fetch('/api/v1/mission/replay', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({speed: next})
+    });
+  }
+
+  async function scrubTimeline(idx) {
+    if (state && state.mission_phase !== 'POST_MISSION') {
+      await setMissionPhase('POST_MISSION');
+    }
+    await fetch('/api/v1/mission/replay', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({frame_index: Number(idx), playing: false})
+    });
+  }
+
+  window.addEventListener('keydown', (e) => {
+    if (e.key === '1') triggerPlay('PLAY_01_PERIMETER_CAP');
+    else if (e.key === '2') triggerPlay('PLAY_02_SWARM_EW_BARRIER');
+    else if (e.key === '3') triggerPlay('PLAY_03_KINETIC_WOLF_PACK');
+    else if (e.key === '4') triggerSingleJam();
+    else if (e.key === 'Enter') approvePendingPlay();
+    else if (e.code === 'Space') { e.preventDefault(); triggerPlay('PLAY_04_CEASEFIRE_RTB'); }
+  });
+
+  function sizeCanvas(canvas) {
+    const rect = canvas.parentElement.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+    if (canvas.width !== Math.floor(rect.width * dpr) || canvas.height !== Math.floor(rect.height * dpr)) {
+      canvas.width = Math.floor(rect.width * dpr);
+      canvas.height = Math.floor(rect.height * dpr);
+    }
+    const ctx = canvas.getContext('2d');
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    return {ctx, w: rect.width, h: rect.height};
+  }
+
+  function getSelectedTrack() {
+    if (!state || !state.tracks || !state.tracks.length) return null;
+    return state.tracks.find(t => t.target_id === state.selected_target_id) || state.tracks[0];
+  }
+
+  // 1. RENDER 360° PULSE-DOPPLER & MULTI-ASSET SWARM PPI SCOPE (100% MONOCHROME)
+  function renderRadarScope() {
+    const canvas = document.getElementById('radarCanvas');
+    const {ctx, w, h} = sizeCanvas(canvas);
+    const cx = w * 0.5;
+    const cy = h * 0.5;
+    const maxR = Math.min(w, h) * 0.44;
+    const worldMax = 1800.0;
+
     ctx.fillStyle = '#000000';
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.fillRect(0, 0, w, h);
 
-    const cx = canvas.width / 2;
-    const cy = canvas.height / 2 + 40;
-
-    // Concentric Range Rings (500m, 1500m, 3500m)
-    const rings = [
-      { r: 500, label: '500m KILLZONE', alpha: 0.65, dash: [] },
-      { r: 1500, label: '1500m WARNING', alpha: 0.40, dash: [4, 4] },
-      { r: 3500, label: '3500m DETECTION', alpha: 0.22, dash: [2, 4] }
-    ];
-
-    for (const ring of rings) {
-      ctx.save();
-      ctx.strokeStyle = `rgba(255, 255, 255, ${ring.alpha})`;
-      ctx.lineWidth = 1;
-      ctx.setLineDash(ring.dash);
-
-      ctx.beginPath();
-      for (let th = 0; th <= 360; th += 4) {
-        const rad = th * Math.PI / 180;
-        const e = ring.r * Math.sin(rad);
-        const n = ring.r * Math.cos(rad);
-        const p = project(e, n, 0);
-        if (th === 0) ctx.moveTo(p.x, p.y);
-        else ctx.lineTo(p.x, p.y);
-      }
-      ctx.closePath();
-      ctx.stroke();
-
-      // Label
-      const pLbl = project(ring.r * 0.707, ring.r * 0.707, 0);
-      ctx.fillStyle = `rgba(255, 255, 255, ${ring.alpha + 0.1})`;
-      ctx.font = '9px "JetBrains Mono"';
-      ctx.fillText(ring.label, pLbl.x + 4, pLbl.y - 2);
-      ctx.restore();
-    }
-
-    // Base HQ Center Marker
-    const pBase = project(0, 0, 0);
-    ctx.strokeStyle = '#FFFFFF';
+    // Outer Azimuth Degree Dial (000° - 350°)
+    ctx.strokeStyle = '#333333';
     ctx.lineWidth = 1;
     ctx.beginPath();
-    ctx.arc(pBase.x, pBase.y, 5, 0, Math.PI * 2);
+    ctx.arc(cx, cy, maxR, 0, Math.PI * 2);
     ctx.stroke();
-    ctx.fillStyle = '#FFFFFF';
-    ctx.font = '9px "JetBrains Mono"';
-    ctx.fillText('BASE HQ', pBase.x + 8, pBase.y + 3);
 
-    if (!telemetry || !telemetry.tracks) return;
-
-    let selectedScreenPos = null;
-
-    // Render Targets
-    for (const trk of telemetry.tracks) {
-      const p = project(trk.east_m, trk.north_m, trk.alt_m);
-      const isSelected = (trk.target_id === selectedTargetId);
-      if (isSelected) selectedScreenPos = p;
-
-      // 3D Elevation Stalk (Vertical drop-line to ground shadow)
-      ctx.strokeStyle = trk.is_friendly ? 'rgba(180, 180, 180, 0.4)' : 'rgba(255, 255, 255, 0.5)';
-      ctx.lineWidth = 1;
-      ctx.setLineDash([2, 2]);
+    ctx.font = '8.5px "JetBrains Mono"';
+    ctx.fillStyle = '#8A8A8A';
+    ctx.textAlign = 'center';
+    for (let deg = 0; deg < 360; deg += 10) {
+      const rad = ((deg - 90) * Math.PI) / 180;
+      const inner = deg % 30 === 0 ? maxR - 7 : maxR - 3;
       ctx.beginPath();
-      ctx.moveTo(p.x, p.y);
-      ctx.lineTo(p.x, p.groundY);
+      ctx.moveTo(cx + Math.cos(rad) * inner, cy + Math.sin(rad) * inner);
+      ctx.lineTo(cx + Math.cos(rad) * maxR, cy + Math.sin(rad) * maxR);
       ctx.stroke();
-      ctx.setLineDash([]);
+      if (deg % 30 === 0) {
+        ctx.fillText(String(deg).padStart(3, '0'), cx + Math.cos(rad) * (maxR + 11), cy + Math.sin(rad) * (maxR + 11) + 3);
+      }
+    }
 
-      // Ground plane shadow circle
-      ctx.fillStyle = 'rgba(255, 255, 255, 0.15)';
-      ctx.beginPath();
-      ctx.arc(p.x, p.groundY, 3, 0, Math.PI * 2);
-      ctx.fill();
+    // Crosshairs
+    ctx.strokeStyle = '#1C1C1C';
+    ctx.beginPath();
+    ctx.moveTo(cx - maxR, cy); ctx.lineTo(cx + maxR, cy);
+    ctx.moveTo(cx, cy - maxR); ctx.lineTo(cx, cy + maxR);
+    ctx.stroke();
 
-      // Historical Flight Trail
-      if (trk.trail && trk.trail.length > 1) {
-        ctx.strokeStyle = trk.is_friendly ? 'rgba(160, 160, 160, 0.35)' : 'rgba(255, 255, 255, 0.4)';
+    if (!state) return;
+
+    // Concentric Range Rings (500m solid white killzone, 1100m dashed warning, 1650m dotted)
+    const kzR = (state.geofence.killzone_m / worldMax) * maxR;
+    const warnR = (1150.0 / worldMax) * maxR;
+    const detR = (1650.0 / worldMax) * maxR;
+
+    // Solid white Killzone ring
+    ctx.strokeStyle = '#FFFFFF';
+    ctx.lineWidth = 1.2;
+    ctx.beginPath();
+    ctx.arc(cx, cy, kzR, 0, Math.PI * 2);
+    ctx.stroke();
+
+    // Dashed Warning ring
+    ctx.strokeStyle = '#737373';
+    ctx.setLineDash([4, 4]);
+    ctx.beginPath();
+    ctx.arc(cx, cy, warnR, 0, Math.PI * 2);
+    ctx.stroke();
+
+    // Dotted Detection ring
+    ctx.strokeStyle = '#404040';
+    ctx.setLineDash([2, 4]);
+    ctx.beginPath();
+    ctx.arc(cx, cy, detR, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    ctx.fillStyle = '#A3A3A3';
+    ctx.font = '8.5px "JetBrains Mono"';
+    ctx.textAlign = 'left';
+    ctx.fillText(`${Math.round(state.geofence.killzone_m)}m KILLZONE`, cx + 4, cy - kzR + 10);
+
+    // Radar Sweep Beam
+    const sweepRad = ((state.radar_sweep_deg - 90) * Math.PI) / 180;
+    const grad = ctx.createRadialGradient(cx, cy, 4, cx, cy, maxR);
+    grad.addColorStop(0, 'rgba(255, 255, 255, 0.20)');
+    grad.addColorStop(1, 'rgba(255, 255, 255, 0.02)');
+    ctx.fillStyle = grad;
+    ctx.beginPath();
+    ctx.moveTo(cx, cy);
+    ctx.arc(cx, cy, maxR, sweepRad - 0.30, sweepRad);
+    ctx.closePath();
+    ctx.fill();
+
+    // Active Directional EW Jammer Sector Cone (Translucent White Wedge)
+    state.effectors.forEach(eff => {
+      if (eff.state.startsWith('ENGAGED') && eff.azimuth_deg !== undefined) {
+        const az = ((eff.azimuth_deg - 90) * Math.PI) / 180;
+        ctx.fillStyle = 'rgba(255, 255, 255, 0.14)';
+        ctx.strokeStyle = '#FFFFFF';
         ctx.lineWidth = 1;
         ctx.beginPath();
-        for (let i = 0; i < trk.trail.length; i++) {
-          const pt = project(trk.trail[i][0], trk.trail[i][1], trk.trail[i][2]);
-          if (i === 0) ctx.moveTo(pt.x, pt.y);
-          else ctx.lineTo(pt.x, pt.y);
-        }
+        ctx.moveTo(cx, cy);
+        ctx.arc(cx, cy, maxR * 0.88, az - 0.24, az + 0.24);
+        ctx.closePath();
+        ctx.fill();
+        ctx.stroke();
+      }
+    });
+
+    // BDA Kinetic Splash Shockwaves
+    state.splash_events.forEach(sp => {
+      const sx = cx + (sp.east_m / worldMax) * maxR;
+      const sy = cy - (sp.north_m / worldMax) * maxR;
+      const r = 14 + (tick % 20) * 1.4;
+      ctx.strokeStyle = '#FFFFFF';
+      ctx.lineWidth = 1.8;
+      ctx.beginPath();
+      ctx.arc(sx, sy, r, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.fillStyle = '#FFFFFF';
+      ctx.fillText(`SPLASH // ${sp.target_id}`, sx + 10, sy - 6);
+    });
+
+    // Base HQ Core
+    ctx.fillStyle = '#FFFFFF';
+    ctx.fillRect(cx - 4, cy - 4, 8, 8);
+
+    // Plot Swarm Entities (Monochrome MIL-STD-2525D)
+    screenPoints = {};
+    state.tracks.forEach(trk => {
+      const tx = cx + (trk.east_m / worldMax) * maxR;
+      const ty = cy - (trk.north_m / worldMax) * maxR;
+      screenPoints[trk.target_id] = {x: tx, y: ty};
+      const isFriendly = trk.affiliation.startsWith('FRIENDLY');
+      const isSelected = trk.target_id === state.selected_target_id;
+
+      // Historical Trail
+      if (trk.trail && trk.trail.length > 1) {
+        ctx.strokeStyle = isFriendly ? 'rgba(255,255,255,0.75)' : 'rgba(163,163,163,0.45)';
+        ctx.lineWidth = isFriendly ? 1.5 : 1.0;
+        ctx.beginPath();
+        trk.trail.forEach(([ex, ny], i) => {
+          const px = cx + (ex / worldMax) * maxR;
+          const py = cy - (ny / worldMax) * maxR;
+          if (i === 0) ctx.moveTo(px, py);
+          else ctx.lineTo(px, py);
+        });
+        ctx.lineTo(tx, ty);
         ctx.stroke();
       }
 
-      // Predicted 3D Trajectory Tube (Dashed)
-      if (trk.predicted_path && trk.predicted_path.length > 1) {
-        ctx.strokeStyle = 'rgba(255, 255, 255, 0.7)';
-        ctx.lineWidth = 1;
-        ctx.setLineDash([3, 3]);
+      // CUDA GPU Predicted Trajectory Spline
+      if (trk.predicted_path && trk.predicted_path.length > 1 && !isFriendly) {
+        ctx.strokeStyle = '#737373';
+        ctx.setLineDash([2, 3]);
         ctx.beginPath();
-        for (let i = 0; i < trk.predicted_path.length; i++) {
-          const pt = project(trk.predicted_path[i][0], trk.predicted_path[i][1], trk.predicted_path[i][2]);
-          if (i === 0) ctx.moveTo(pt.x, pt.y);
-          else ctx.lineTo(pt.x, pt.y);
-        }
+        ctx.moveTo(tx, ty);
+        trk.predicted_path.slice(0, 14).forEach(([pe, pn]) => {
+          ctx.lineTo(cx + (pe / worldMax) * maxR, cy - (pn / worldMax) * maxR);
+        });
         ctx.stroke();
         ctx.setLineDash([]);
       }
 
-      // Airframe Symbology
-      if (trk.is_friendly) {
-        // Friendly Blue-Force Diamond
+      // Locked Target Ring
+      if (isSelected) {
         ctx.strokeStyle = '#FFFFFF';
         ctx.lineWidth = 1.5;
-        ctx.strokeRect(p.x - 4, p.y - 4, 8, 8);
+        ctx.beginPath();
+        ctx.arc(tx, ty, 13, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+
+      // Monochrome Tactical Symbology
+      if (isFriendly) {
+        // Solid White Chevron / Circle for Collaborative Wingmen & Interceptors
         ctx.fillStyle = '#FFFFFF';
-        ctx.font = '9px "JetBrains Mono"';
-        ctx.fillText(trk.callsign || trk.target_id, p.x + 8, p.y + 3);
+        ctx.beginPath();
+        ctx.arc(tx, ty, 5.5, 0, Math.PI * 2);
+        ctx.fill();
       } else {
-        // Hostile Target Square
-        ctx.fillStyle = isSelected ? '#FFFFFF' : '#888888';
-        ctx.fillRect(p.x - 3, p.y - 3, 6, 6);
+        // Hollow White Diamond with Center Pip for Hostile Swarm Drones
         ctx.strokeStyle = '#FFFFFF';
-        ctx.strokeRect(p.x - 5, p.y - 5, 10, 10);
+        ctx.fillStyle = '#000000';
+        ctx.lineWidth = 1.6;
+        ctx.beginPath();
+        ctx.moveTo(tx, ty - 7);
+        ctx.lineTo(tx + 7, ty);
+        ctx.lineTo(tx, ty + 7);
+        ctx.lineTo(tx - 7, ty);
+        ctx.closePath();
+        ctx.fill();
+        ctx.stroke();
 
         ctx.fillStyle = '#FFFFFF';
-        ctx.font = '9px "JetBrains Mono"';
-        ctx.fillText(`${trk.target_id} [${trk.threat_score}]`, p.x + 8, p.y + 3);
-      }
-    }
-
-    // Dynamic Tether Leader Line connecting selected target to Right Detail HUD
-    const tether = document.getElementById('tetherLine');
-    if (selectedScreenPos && tether) {
-      const rightPod = document.getElementById('rightDetailPod').getBoundingClientRect();
-      tether.setAttribute('x1', selectedScreenPos.x);
-      tether.setAttribute('y1', selectedScreenPos.y);
-      tether.setAttribute('x2', rightPod.left);
-      tether.setAttribute('y2', rightPod.top + 50);
-    }
-  }
-
-  // Animate Battlespace Loop
-  function animate() {
-    render3dBattlespace();
-    requestAnimationFrame(animate);
-  }
-  requestAnimationFrame(animate);
-
-  // Update UI Elements from Telemetry Snapshot
-  function updateUI(data) {
-    telemetry = data;
-    document.getElementById('clockUtc').textContent = new Date().toUTCString().slice(17, 25) + ' UTC';
-
-    // Top Ribbon
-    if (data.defcon_label) {
-      document.getElementById('defconBadge').textContent = data.defcon_label;
-    }
-    if (data.cuda_telemetry) {
-      const c = data.cuda_telemetry;
-      document.getElementById('gpuTelemetryBadge').textContent =
-        `GPU: ${c.device_name || 'RTX 3050'} | VRAM: ${c.vram_allocated_mb || 0}MB / ${c.total_vram_mb || 4096}MB`;
-    }
-
-    // Left Track List
-    const trackListEl = document.getElementById('trackList');
-    if (data.tracks) {
-      document.getElementById('trackCountLabel').textContent = `${data.tracks.length} TRACKS`;
-      trackListEl.innerHTML = '';
-      for (const trk of data.tracks) {
-        const card = document.createElement('div');
-        card.className = `track-card ${trk.target_id === selectedTargetId ? 'active' : ''}`;
-        card.onclick = () => selectTarget(trk.target_id);
-
-        const pillClass = trk.threat_score >= 70 ? 'threat-pill inverted' : 'threat-pill';
-        card.innerHTML = `
-          <div class="track-card-header">
-            <span class="target-id">${trk.is_friendly ? trk.callsign : trk.target_id}</span>
-            <span class="${pillClass}">${trk.is_friendly ? 'FRIENDLY' : trk.threat_score}</span>
-          </div>
-          <div class="track-card-body">
-            <span>${trk.drone_class}</span>
-            <span>${trk.range_m}m</span>
-          </div>
-        `;
-        trackListEl.appendChild(card);
-      }
-    }
-
-    // Right Detail HUD
-    const selTrack = data.tracks?.find(t => t.target_id === selectedTargetId) || data.tracks?.[0];
-    if (selTrack) {
-      document.getElementById('detailTargetId').textContent = selTrack.target_id;
-      document.getElementById('dAffiliation').textContent = selTrack.affiliation;
-      document.getElementById('dClass').textContent = selTrack.drone_class;
-      document.getElementById('dRf').textContent = selTrack.rf_protocol;
-      document.getElementById('dRangeBearing').textContent = `${selTrack.range_m}m // ${selTrack.bearing_deg}° ${selTrack.bearing_cardinal}`;
-      document.getElementById('dEnu').textContent = `(${selTrack.east_m}, ${selTrack.north_m}, ${selTrack.alt_m})`;
-      document.getElementById('dSpeed').textContent = `${selTrack.speed_ms} m/s // +${selTrack.closing_vel_ms} m/s`;
-      document.getElementById('dTti').textContent = selTrack.tti_s ? `${selTrack.tti_s}s` : 'NOMINAL';
-      document.getElementById('dKillChain').textContent = `${selTrack.kill_chain_stage} (${selTrack.kill_chain_num}/6)`;
-      document.getElementById('dWtaRec').textContent = selTrack.wta_recommendation;
-
-      if (selTrack.imm_modes) {
-        const pCv = selTrack.imm_modes.CV || 0;
-        const pCtrv = selTrack.imm_modes.CTRV || 0;
-        const pDive = selTrack.imm_modes.CA_DIVE || 0;
-        document.getElementById('barCv').style.width = `${pCv * 100}%`;
-        document.getElementById('txtCv').textContent = pCv.toFixed(2);
-        document.getElementById('barCtrv').style.width = `${pCtrv * 100}%`;
-        document.getElementById('txtCtrv').textContent = pCtrv.toFixed(2);
-        document.getElementById('barDive').style.width = `${pDive * 100}%`;
-        document.getElementById('txtDive').textContent = pDive.toFixed(2);
+        ctx.fillRect(tx - 1.5, ty - 1.5, 3, 3);
       }
 
-      renderFlirPreview(selTrack);
-    }
-
-    // HOTL Intent Banner
-    const banner = document.getElementById('intentBanner');
-    if (data.pending_intent && governanceMode === 'HOTL_SUPERVISED') {
-      banner.style.display = 'flex';
-      document.getElementById('intentText').textContent =
-        `HOTL APPROVAL REQUIRED: ${data.pending_intent.title} (${data.pending_intent.description})`;
-    } else {
-      banner.style.display = 'none';
-    }
-
-    // Autonomy Play Active Button
-    const play = data.current_autonomy_play;
-    ['btnPlay01', 'btnPlay02', 'btnPlay03', 'btnPlay04'].forEach(id => {
-      document.getElementById(id).classList.remove('active');
+      // Track Callout
+      ctx.fillStyle = isSelected ? '#FFFFFF' : '#A3A3A3';
+      ctx.font = isSelected ? 'bold 9.5px "JetBrains Mono"' : '8.5px "JetBrains Mono"';
+      ctx.fillText(`${trk.target_id} (${Math.round(trk.range_m)}m)`, tx + 10, ty + 3);
     });
-    if (play === 'PLAY_01_PERIMETER_CAP') document.getElementById('btnPlay01').classList.add('active');
-    else if (play === 'PLAY_02_SWARM_EW_BARRIER') document.getElementById('btnPlay02').classList.add('active');
-    else if (play === 'PLAY_03_KINETIC_WOLF_PACK') document.getElementById('btnPlay03').classList.add('active');
-    else if (play === 'PLAY_04_CEASEFIRE_RTB') document.getElementById('btnPlay04').classList.add('active');
+  }
 
-    // Scrubber total frames in post-mission
-    if (data.flight_recorder_total_frames) {
-      document.getElementById('timelineSlider').max = Math.max(1, data.flight_recorder_total_frames - 1);
+  document.addEventListener('DOMContentLoaded', () => {
+    document.getElementById('radarCanvas').addEventListener('click', (e) => {
+      const rect = e.target.getBoundingClientRect();
+      const mx = e.clientX - rect.left;
+      const my = e.clientY - rect.top;
+      let bestId = null;
+      let bestD = 26;
+      Object.entries(screenPoints).forEach(([id, pt]) => {
+        const d = Math.hypot(mx - pt.x, my - pt.y);
+        if (d < bestD) { bestD = d; bestId = id; }
+      });
+      if (bestId) selectTrack(bestId);
+    });
+  });
+
+  // 2. RENDER MONOCHROME OPTRONIC GIMBAL SENSOR
+  function renderOptronic() {
+    const canvas = document.getElementById('optronicCanvas');
+    const {ctx, w, h} = sizeCanvas(canvas);
+    const trk = getSelectedTrack();
+
+    const bg = polarity === 'WH' ? '#080808' : '#E5E5E5';
+    const fg = polarity === 'WH' ? '#FFFFFF' : '#000000';
+    const mid = polarity === 'WH' ? '#404040' : '#A3A3A3';
+
+    ctx.fillStyle = bg;
+    ctx.fillRect(0, 0, w, h);
+
+    // Subtle tactical grid & horizon
+    ctx.strokeStyle = mid;
+    ctx.lineWidth = 0.7;
+    ctx.beginPath();
+    ctx.moveTo(16, h * 0.55); ctx.lineTo(w - 16, h * 0.55);
+    ctx.moveTo(w * 0.5, 16); ctx.lineTo(w * 0.5, h - 16);
+    ctx.stroke();
+
+    if (!trk) return;
+
+    const tx = w * 0.5 + Math.sin(tick * 0.05) * 20;
+    const ty = h * 0.48 + Math.cos(tick * 0.04) * 14;
+
+    // Drone thermal silhouette
+    ctx.save();
+    ctx.translate(tx, ty);
+    ctx.strokeStyle = fg;
+    ctx.lineWidth = 2.2;
+    ctx.beginPath();
+    ctx.moveTo(-24, -10); ctx.lineTo(24, 10);
+    ctx.moveTo(-24, 10); ctx.lineTo(24, -10);
+    ctx.stroke();
+    ctx.fillStyle = fg;
+    ctx.fillRect(-9, -5, 18, 10);
+    if (trk.payload_detected) {
+      ctx.fillRect(-5, 5, 10, 7);
+    }
+    [[-24, -10], [24, -10], [-24, 10], [24, 10]].forEach(([rx, ry]) => {
+      ctx.beginPath();
+      ctx.ellipse(rx, ry, 10, 3, (tick * 0.35) % Math.PI, 0, Math.PI * 2);
+      ctx.stroke();
+    });
+    ctx.restore();
+
+    // Precision Corner Brackets
+    const b = 38, cl = 10;
+    ctx.strokeStyle = fg;
+    ctx.lineWidth = 1.6;
+    ctx.beginPath();
+    ctx.moveTo(tx - b, ty - b + cl); ctx.lineTo(tx - b, ty - b); ctx.lineTo(tx - b + cl, ty - b);
+    ctx.moveTo(tx + b - cl, ty - b); ctx.lineTo(tx + b, ty - b); ctx.lineTo(tx + b, ty - b + cl);
+    ctx.moveTo(tx - b, ty + b - cl); ctx.lineTo(tx - b, ty + b); ctx.lineTo(tx - b + cl, ty + b);
+    ctx.moveTo(tx + b - cl, ty + b); ctx.lineTo(tx + b, ty + b); ctx.lineTo(tx + b, ty + b - cl);
+    ctx.stroke();
+
+    // Kalman Trajectory Spline
+    ctx.setLineDash([3, 3]);
+    ctx.beginPath();
+    ctx.moveTo(tx, ty);
+    ctx.lineTo(tx + trk.vx_ms * 1.4, ty - trk.vz_ms * 2.5);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    ctx.fillStyle = fg;
+    ctx.font = 'bold 9.5px "JetBrains Mono"';
+    ctx.fillText(`LOCK: ${trk.target_id} [${trk.drone_class}]`, 12, 18);
+    ctx.fillText(`TTI: ${trk.tti_s > 900 ? 'N/A' : trk.tti_s + 's'} | VEL: ${trk.speed_ms} m/s`, 12, 30);
+  }
+
+  // 3. RENDER CUDA TORCH.STFT MICRO-DOPPLER SPECTROGRAM (0-300 Hz GRAYSCALE)
+  function renderMicroDoppler() {
+    const canvas = document.getElementById('dopplerCanvas');
+    const {ctx, w, h} = sizeCanvas(canvas);
+    ctx.fillStyle = '#000000';
+    ctx.fillRect(0, 0, w, h);
+
+    if (!state || !state.micro_doppler_stft) return;
+    const mat = state.micro_doppler_stft;
+    const rows = mat.length;
+    const cols = mat[0].length;
+    const padL = 28, padR = 22, padB = 16, padT = 8;
+    const plotW = w - padL - padR;
+    const plotH = h - padT - padB;
+    const cw = plotW / cols;
+    const ch = plotH / rows;
+
+    for (let r = 0; r < rows; r++) {
+      for (let c = 0; c < cols; c++) {
+        const val = mat[rows - 1 - r][c];
+        const lum = Math.floor(val * 255);
+        ctx.fillStyle = `rgb(${lum},${lum},${lum})`;
+        ctx.fillRect(padL + c * cw, padT + r * ch, Math.ceil(cw), Math.ceil(ch));
+      }
+    }
+
+    // Frequency Y-axis ticks & luminance bar
+    ctx.fillStyle = '#8A8A8A';
+    ctx.font = '8px "JetBrains Mono"';
+    ctx.fillText('300', 4, padT + 8);
+    ctx.fillText('150', 4, padT + plotH * 0.5);
+    ctx.fillText('0Hz', 4, padT + plotH);
+
+    const barGrad = ctx.createLinearGradient(0, padT, 0, padT + plotH);
+    barGrad.addColorStop(0, '#FFFFFF');
+    barGrad.addColorStop(1, '#000000');
+    ctx.fillStyle = barGrad;
+    ctx.fillRect(w - 14, padT, 7, plotH);
+  }
+
+  // 4. RENDER PiP 4X FLIR TARGET ZOOM
+  function renderPipZoom() {
+    const canvas = document.getElementById('pipCanvas');
+    const {ctx, w, h} = sizeCanvas(canvas);
+    const trk = getSelectedTrack();
+
+    ctx.fillStyle = '#060606';
+    ctx.fillRect(0, 0, w, h);
+
+    // Thermal grain noise dots
+    ctx.fillStyle = 'rgba(255,255,255,0.05)';
+    for (let i = 0; i < 90; i++) {
+      ctx.fillRect(Math.random() * w, Math.random() * h, 2, 2);
+    }
+
+    const cx = w * 0.5;
+    const cy = h * 0.52;
+
+    if (trk) {
+      // High-contrast White-Hot thermal bloom silhouette
+      ctx.save();
+      ctx.translate(cx, cy);
+      ctx.shadowColor = '#FFFFFF';
+      ctx.shadowBlur = 14;
+      ctx.strokeStyle = '#FFFFFF';
+      ctx.lineWidth = 3.2;
+      ctx.beginPath();
+      ctx.moveTo(-42, -16); ctx.lineTo(42, 16);
+      ctx.moveTo(-42, 16); ctx.lineTo(42, -16);
+      ctx.stroke();
+
+      ctx.fillStyle = '#FFFFFF';
+      ctx.fillRect(-16, -9, 32, 18);
+      if (trk.payload_detected) {
+        ctx.fillRect(-8, 9, 16, 11);
+      }
+      ctx.restore();
+    }
+
+    // Crisp Corner Reticle
+    const b = 48, cl = 14;
+    ctx.strokeStyle = '#FFFFFF';
+    ctx.lineWidth = 1.6;
+    ctx.beginPath();
+    ctx.moveTo(cx - b, cy - b + cl); ctx.lineTo(cx - b, cy - b); ctx.lineTo(cx - b + cl, cy - b);
+    ctx.moveTo(cx + b - cl, cy - b); ctx.lineTo(cx + b, cy - b); ctx.lineTo(cx + b, cy - b + cl);
+    ctx.moveTo(cx - b, cy + b - cl); ctx.lineTo(cx - b, cy + b); ctx.lineTo(cx - b + cl, cy + b);
+    ctx.moveTo(cx + b - cl, cy + b); ctx.lineTo(cx + b, cy + b); ctx.lineTo(cx + b, cy + b - cl);
+    ctx.stroke();
+
+    // Center Precision Crosshair
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(cx - 14, cy); ctx.lineTo(cx + 14, cy);
+    ctx.moveTo(cx, cy - 14); ctx.lineTo(cx, cy + 14);
+    ctx.stroke();
+
+    ctx.fillStyle = '#FFFFFF';
+    ctx.font = 'bold 9.5px "JetBrains Mono"';
+    ctx.fillText('FLIR THERMAL // WHITE-HOT', 10, 16);
+    if (trk) {
+      ctx.fillStyle = '#A3A3A3';
+      ctx.fillText(`ALT: ${Math.round(trk.alt_m)}m | AZ: ${Math.round(trk.bearing_deg)}°`, 10, h - 10);
     }
   }
 
-  // Render Synthetic FLIR Monochrome Thermal Canvas
-  function renderFlirPreview(track) {
-    const fc = document.getElementById('flirCanvas');
-    const fctx = fc.getContext('2d');
-    fctx.fillStyle = '#000000';
-    fctx.fillRect(0, 0, fc.width, fc.height);
+  // 5. SYNC DOM STATE
+  function syncState(s) {
+    state = s;
+    document.getElementById('utcClock').textContent = new Date().toISOString().slice(11, 19) + ' UTC';
+    document.getElementById('defconText').textContent = s.defcon_label;
+    document.getElementById('roeText').textContent = s.roe_mode === 'FULL_AUTONOMOUS_ROE' ? 'AUTONOMOUS ROE' : 'HOTL SUPERVISED';
 
-    // Crosshairs
-    fctx.strokeStyle = '#333333';
-    fctx.lineWidth = 1;
-    fctx.beginPath();
-    fctx.moveTo(fc.width / 2, 0); fctx.lineTo(fc.width / 2, fc.height);
-    fctx.moveTo(0, fc.height / 2); fctx.lineTo(fc.width, fc.height / 2);
-    fctx.stroke();
+    // CUDA Badge
+    const c = s.cuda;
+    document.getElementById('cudaHudBadge').textContent =
+      `${c.backend} | ${c.kernel_latency_ms}ms | VRAM ${c.vram_allocated_mb}MB`;
 
-    // Hot Thermal Airframe Silhouette
-    const cx = fc.width / 2;
-    const cy = fc.height / 2;
-    fctx.fillStyle = '#FFFFFF';
-    fctx.beginPath();
-    fctx.arc(cx, cy, 6, 0, Math.PI * 2);
-    fctx.fill();
+    // Phase Tabs & Pre-Mission Drawer
+    ['PRE', 'LIVE', 'POST'].forEach(k => document.getElementById('tab' + k).classList.remove('active'));
+    if (s.mission_phase === 'PRE_MISSION') document.getElementById('tabPRE').classList.add('active');
+    else if (s.mission_phase === 'POST_MISSION') document.getElementById('tabPOST').classList.add('active');
+    else document.getElementById('tabLIVE').classList.add('active');
 
-    // Rotors
-    fctx.strokeStyle = '#FFFFFF';
-    fctx.lineWidth = 1.5;
-    fctx.beginPath();
-    fctx.ellipse(cx - 16, cy - 8, 8, 3, 0, 0, Math.PI * 2);
-    fctx.ellipse(cx + 16, cy + 8, 8, 3, 0, 0, Math.PI * 2);
-    fctx.ellipse(cx - 16, cy + 8, 8, 3, 0, 0, Math.PI * 2);
-    fctx.ellipse(cx + 16, cy - 8, 8, 3, 0, 0, Math.PI * 2);
-    fctx.stroke();
+    document.getElementById('preMissionDrawer').style.display = s.mission_phase === 'PRE_MISSION' ? 'flex' : 'none';
 
-    // Bounding targeting box
-    fctx.strokeStyle = '#FFFFFF';
-    fctx.strokeRect(cx - 24, cy - 18, 48, 36);
-    fctx.font = '8px "JetBrains Mono"';
-    fctx.fillText('FLIR WHITE-HOT', 6, 12);
+    // HOTL Approval Banner
+    const hotl = document.getElementById('hotlBanner');
+    if (s.pending_autonomy_play && s.mission_phase === 'LIVE_EXECUTION') {
+      hotl.style.display = 'flex';
+      document.getElementById('hotlBannerText').textContent =
+        `AUTONOMY INTENT: ${s.pending_autonomy_play.play_id} (${s.pending_autonomy_play.reason})`;
+    } else {
+      hotl.style.display = 'none';
+    }
+
+    // Swarm Matrix Table
+    document.getElementById('assetRatioTag').textContent =
+      `HOSTILE: ${s.counts.hostile} | FRIENDLY: ${s.counts.friendly} | SPLASH: ${s.counts.neutralized}`;
+
+    const tbody = document.getElementById('swarmTableBody');
+    tbody.innerHTML = s.tracks.map(t => {
+      const sel = t.target_id === s.selected_target_id ? 'sel-row' : '';
+      return `<tr class="${sel}" onclick="selectTrack('${t.target_id}')">
+        <td style="font-weight:700;">${t.target_id}</td>
+        <td style="color:#A3A3A3;">${t.cluster_id}</td>
+        <td>${t.speed_ms} m/s</td>
+        <td>${Math.round(t.range_m)}m</td>
+        <td>${t.tti_s > 900 ? '---' : t.tti_s + 's'}</td>
+        <td style="color:#D4D4D4;">${t.assigned_asset}</td>
+      </tr>`;
+    }).join('');
+
+    const trk = getSelectedTrack();
+    if (trk) {
+      document.getElementById('optLockFoot').textContent =
+        `TGT LOCK: ${trk.target_id} | TTI: ${trk.tti_s > 900 ? 'N/A' : trk.tti_s + 's'}`;
+      document.getElementById('rpmTag').textContent = `${trk.rotor_rpm} RPM [STFT]`;
+      document.getElementById('pipTargetTag').textContent = `FLIR 4X // ${trk.target_id}`;
+      document.getElementById('pipOrdnanceFoot').textContent =
+        trk.payload_detected ? 'THERMAL GRAIN // PAYLOAD POSITIVE' : 'THERMAL GRAIN // CLEAN AIRFRAME';
+      document.getElementById('pipRfFoot').textContent = `LINK: ${trk.rf_protocol}`;
+    }
+
+    // Timeline Scrubber
+    const slider = document.getElementById('timelineSlider');
+    slider.max = Math.max(1, s.replay_total - 1);
+    slider.value = s.replay_index;
+    document.getElementById('replayCounterTag').textContent =
+      `${s.mission_phase === 'POST_MISSION' ? 'DEBRIEF REPLAY' : 'LIVE REC'} // FRAME ${String(s.replay_index + 1).padStart(4, '0')}/${String(s.replay_total).padStart(4, '0')}`;
+    document.getElementById('playPauseBtn').textContent = s.replay_playing ? 'PAUSE' : 'PLAY';
+    document.getElementById('speedBtn').textContent = s.replay_speed + 'X';
+
+    // Autonomy Play Cards
+    ['cardPlay1', 'cardPlay2', 'cardPlay3'].forEach(id => document.getElementById(id).classList.remove('active-play'));
+    if (s.active_play_id === 'PLAY_01_PERIMETER_CAP') document.getElementById('cardPlay1').classList.add('active-play');
+    if (s.active_play_id === 'PLAY_02_SWARM_EW_BARRIER') document.getElementById('cardPlay2').classList.add('active-play');
+    if (s.active_play_id === 'PLAY_03_KINETIC_WOLF_PACK') document.getElementById('cardPlay3').classList.add('active-play');
+
+    const siloEff = s.effectors.find(e => e.id === 'KINETIC_SILO');
+    if (siloEff) {
+      document.getElementById('stPlay3').textContent = `${siloEff.ammo} SILOS`;
+    }
+
+    // Audit Ledger
+    document.getElementById('auditList').innerHTML = s.audit_tail.map(b => {
+      return `<div class="audit-item">
+        <span>[${b.timestamp.slice(11, 19)}] ${b.event_type}</span>
+        <span>#${b.block_hash.slice(0, 8)} ✓</span>
+      </div>`;
+    }).join('');
   }
 
-  // WebSocket Connection
-  function initWebSocket() {
-    const loc = window.location;
-    const wsProto = (loc.protocol === 'https:') ? 'wss:' : 'ws:';
-    const wsUrl = `${wsProto}//${loc.host}/ws/telemetry`;
-    const socket = new WebSocket(wsUrl);
+  function renderAll() {
+    tick++;
+    renderRadarScope();
+    renderOptronic();
+    renderMicroDoppler();
+    renderPipZoom();
+    requestAnimationFrame(renderAll);
+  }
 
-    socket.onmessage = (event) => {
-      try {
-        const data = JSON.parse(event.data);
-        updateUI(data);
-      } catch (err) {}
+  function connectWS() {
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const ws = new WebSocket(`${proto}//${location.host}/ws/telemetry`);
+    ws.onmessage = (e) => {
+      try { syncState(JSON.parse(e.data)); } catch (err) {}
     };
-
-    socket.onclose = () => setTimeout(initWebSocket, 1500);
-  }
-  initWebSocket();
-
-  // API Interaction Functions
-  async function selectTarget(id) {
-    selectedTargetId = id;
-    await fetch('/api/v1/target/select', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ target_id: id })
-    });
+    ws.onclose = () => setTimeout(connectWS, 1200);
   }
 
-  async function engageEffector(effector) {
-    await fetch('/api/v1/countermeasures/engage', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ effector: effector, target_id: selectedTargetId })
-    });
-  }
-
-  async function executeAutonomyPlay(playType) {
-    await fetch('/api/v1/autonomy/play', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ play_type: playType })
-    });
-  }
-
-  async function toggleGovernance() {
-    governanceMode = (governanceMode === 'HOTL_SUPERVISED') ? 'FULL_AUTONOMOUS_ROE' : 'HOTL_SUPERVISED';
-    document.getElementById('btnGovernance').textContent = governanceMode;
-    await fetch('/api/v1/autonomy/governance', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ roe_mode: governanceMode })
-    });
-  }
-
-  async function approveIntent() {
-    if (telemetry?.pending_intent) {
-      await executeAutonomyPlay(telemetry.pending_intent.play_type);
-    }
-  }
-
-  function vetoIntent() {
-    document.getElementById('intentBanner').style.display = 'none';
-  }
-
-  // Mission Phase Switching
-  async function setMissionPhase(phase) {
-    currentPhase = phase;
-    document.getElementById('tabPreMission').classList.remove('active');
-    document.getElementById('tabLiveExecution').classList.remove('active');
-    document.getElementById('tabPostMission').classList.remove('active');
-
-    const preView = document.getElementById('preMissionView');
-    const postView = document.getElementById('postMissionView');
-
-    preView.style.display = 'none';
-    postView.style.display = 'none';
-
-    if (phase === 'PRE_MISSION') {
-      document.getElementById('tabPreMission').classList.add('active');
-      preView.style.display = 'flex';
-    } else if (phase === 'POST_MISSION') {
-      document.getElementById('tabPostMission').classList.add('active');
-      postView.style.display = 'flex';
-      loadPostMissionKPIs();
-    } else {
-      document.getElementById('tabLiveExecution').classList.add('active');
-    }
-
-    await fetch('/api/v1/mission/phase', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ phase: phase })
-    });
-  }
-
-  async function runWargame() {
-    document.getElementById('wargameStatus').textContent = 'Executing 500-trial Monte Carlo simulation...';
-    const res = await fetch('/api/v1/mission/wargame', { method: 'POST' });
-    const data = await res.json();
-    document.getElementById('wargameSurvival').textContent = `${data.survival_probability_percent}%`;
-    document.getElementById('wargameStatus').textContent = `Simulation Completed: ${data.survival_probability_percent}% Defense Survival Rate.`;
-  }
-
-  async function loadPostMissionKPIs() {
-    const res = await fetch('/api/v1/mission/kpis');
-    const data = await res.json();
-    document.getElementById('kpiSuccess').textContent = `${data.defense_success_rate}%`;
-    document.getElementById('kpiNeutralized').textContent = `${data.threats_neutralized} / ${data.threats_neutralized}`;
-    document.getElementById('kpiHitRate').textContent = `${data.kinetic_hit_accuracy}%`;
-    document.getElementById('kpiReaction').textContent = `${data.mean_response_time_sec}s`;
-  }
-
-  async function scrubTimeline(frameVal) {
-    replayFrameIdx = parseInt(frameVal);
-    const res = await fetch(`/api/v1/mission/replay?frame=${replayFrameIdx}`);
-    if (res.ok) {
-      const data = await res.json();
-      updateUI(data);
-      document.getElementById('scrubberInfo').textContent =
-        `FRAME #${replayFrameIdx} / ${document.getElementById('timelineSlider').max} | TIMESTAMP: ${data.timestamp ? data.timestamp.slice(11, 19) : ''} UTC`;
-    }
-  }
-
-  function togglePlayback() {
-    isPlaying = !isPlaying;
-    document.getElementById('btnPlayPause').textContent = isPlaying ? '❚❚ PAUSE' : '▶ PLAY';
-    if (isPlaying) runPlaybackLoop();
-  }
-
-  async function runPlaybackLoop() {
-    if (!isPlaying) return;
-    const slider = document.getElementById('timelineSlider');
-    let nextVal = parseInt(slider.value) + 1;
-    if (nextVal > parseInt(slider.max)) nextVal = 0;
-    slider.value = nextVal;
-    await scrubTimeline(nextVal);
-    setTimeout(runPlaybackLoop, 100 / playbackSpeed);
-  }
-
-  function stepFrame(step) {
-    const slider = document.getElementById('timelineSlider');
-    let nextVal = Math.max(0, Math.min(parseInt(slider.max), parseInt(slider.value) + step));
-    slider.value = nextVal;
-    scrubTimeline(nextVal);
-  }
-
-  function setSpeed(spd) {
-    playbackSpeed = spd;
-  }
+  window.addEventListener('load', () => {
+    connectWS();
+    requestAnimationFrame(renderAll);
+  });
 </script>
 </body>
 </html>
@@ -2315,8 +2638,8 @@ MONOLITH_SPATIAL_HTML = r"""<!DOCTYPE html>
 
 @app.get("/", response_class=HTMLResponse)
 @app.get("/command-center", response_class=HTMLResponse)
-async def get_command_center():
-    return HTMLResponse(content=MONOLITH_SPATIAL_HTML)
+async def serve_monochrome_c2():
+    return HTMLResponse(content=MONOCHROME_LATTICE_HTML)
 
 
 def run_server(host: str = "127.0.0.1", port: int = 8080):
