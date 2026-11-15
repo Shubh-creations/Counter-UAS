@@ -1,8 +1,9 @@
 """
-LATTICE-CUAS Tactical Desktop Command Center (v4.0-Lattice).
-Adheres to modern defense C2 design standards (Anduril Lattice / Palantir Gotham / MIL-STD-2525D).
-Integrates IMM-UKF 3D Trajectory Prediction, Multi-Target Swarm Tracking, Multi-Spectral EO/IR FLIR,
-3D AESA Radar Scope, and Weapon-Target Assignment (WTA) Countermeasures.
+LATTICE-CUAS Tactical Desktop Command Center (v6.0-MONOLITH).
+Adheres strictly to the 1000% Achromatic Monochrome Design Standard (#000000 to #FFFFFF).
+Zero green, red, amber, blue, or neon colors. Features CUDA acceleration, IMM-UKF 3D Trajectory
+Prediction, Multi-Target Swarm Tracking, Multi-Spectral EO/IR FLIR, 3D AESA Radar Scope,
+and HOTL Weapon-Target Assignment (WTA) Countermeasures.
 """
 
 import sys
@@ -29,12 +30,8 @@ import torch
 import numpy as np
 import psutil
 
-try:
-    import pynvml as nvml
-except Exception:
-    nvml = None
-
 from utils.logger import get_logger
+from utils.cuda_runtime import get_cuda_engine
 from utils.geo_utils import haversine_distance, calculate_bearing, check_geofence_status
 from utils.visualization import draw_corner_brackets, draw_lead_reticle, draw_trajectory_path
 from ai_core.detection import DroneDetector, TrackedDrone, SyntheticDroneGenerator
@@ -50,16 +47,17 @@ from control_unit.audit_logger import ForensicAuditLogger
 
 logger = get_logger("CUAS.GUI")
 
-# Modern Defense C2 Panel
+
 class DashboardPanel(QFrame):
+    """Monochrome Chamfered Defense C2 Panel."""
     def __init__(self, title="", parent=None):
         super().__init__(parent)
         self.setObjectName("dashboardPanel")
         self.setStyleSheet("""
             #dashboardPanel {
-                background-color: #0B101B;
-                border: 1px solid #1E293B;
-                border-radius: 3px;
+                background-color: #0A0A0A;
+                border: 1px solid #262626;
+                border-radius: 2px;
             }
         """)
 
@@ -69,22 +67,22 @@ class DashboardPanel(QFrame):
 
         if title:
             title_label = QLabel(title)
-            title_label.setFont(QFont("Segoe UI", 9, QFont.Bold))
+            title_label.setFont(QFont("Consolas", 9, QFont.Bold))
             title_label.setStyleSheet("""
-                color: #94A3B8;
+                color: #A3A3A3;
                 padding-bottom: 4px;
-                border-bottom: 1px solid #1E293B;
+                border-bottom: 1px solid #262626;
                 letter-spacing: 1px;
             """)
             self.layout.addWidget(title_label)
 
 
-# High-Density 3D Tactical Radar Scope
 class RadarScopeWidget(QWidget):
+    """High-Density 3D Tactical Radar Scope in Pure Achromatic Grayscale."""
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMinimumSize(240, 240)
-        self.setStyleSheet("background-color: #04070D; border: 1px solid #1E293B; border-radius: 3px;")
+        self.setStyleSheet("background-color: #000000; border: 1px solid #262626; border-radius: 2px;")
         self.sweep_angle = 0.0
         self.contacts: List[Tuple[float, float, str, int]] = []
         self.timer = QTimer(self)
@@ -106,13 +104,13 @@ class RadarScopeWidget(QWidget):
         cx, cy = w // 2, h // 2
         radius = min(cx, cy) - 12
 
-        painter.fillRect(self.rect(), QColor(4, 7, 13))
+        painter.fillRect(self.rect(), QColor(0, 0, 0))
 
-        # Range rings
+        # Monochromatic Range rings (500m, 1500m, 3500m)
         rings = [
-            (0.33, QColor(244, 63, 94, 90), "500m"),
-            (0.66, QColor(245, 158, 11, 80), "1500m"),
-            (1.00, QColor(16, 185, 129, 70), "3500m")
+            (0.33, QColor(255, 255, 255, 120), "500m"),
+            (0.66, QColor(160, 160, 160, 90), "1500m"),
+            (1.00, QColor(80, 80, 80, 70), "3500m")
         ]
         for f, col, lbl in rings:
             r_curr = int(radius * f)
@@ -123,18 +121,18 @@ class RadarScopeWidget(QWidget):
             painter.drawText(cx + 4, cy - r_curr + 10, lbl)
 
         # Crosshairs
-        painter.setPen(QPen(QColor(30, 41, 59), 1))
+        painter.setPen(QPen(QColor(40, 40, 40), 1))
         painter.drawLine(cx - radius, cy, cx + radius, cy)
         painter.drawLine(cx, cy - radius, cx, cy + radius)
 
-        # Rotating AESA sweep line
+        # Rotating AESA sweep line (White/Silver beam)
         rad = math.radians(self.sweep_angle - 90)
         bx = int(cx + radius * math.cos(rad))
         by = int(cy + radius * math.sin(rad))
-        painter.setPen(QPen(QColor(16, 185, 129, 180), 1.5))
+        painter.setPen(QPen(QColor(240, 240, 240, 160), 1.5))
         painter.drawLine(cx, cy, bx, by)
 
-        # Contacts with MIL-STD symbology
+        # Contacts with High-Contrast Monochromatic Symbology
         for az_deg, dist_ratio, level, tid in self.contacts:
             c_rad = math.radians(az_deg - 90)
             c_r = max(10, min(radius, int(radius * dist_ratio)))
@@ -142,64 +140,60 @@ class RadarScopeWidget(QWidget):
             py = int(cy + c_r * math.sin(c_rad))
 
             if level in ["CRITICAL", "HIGH"]:
-                p_col = QColor(244, 63, 94)
+                p_col = QColor(255, 255, 255)
             elif level == "ELEVATED":
-                p_col = QColor(245, 158, 11)
+                p_col = QColor(180, 180, 180)
             else:
-                p_col = QColor(16, 185, 129)
+                p_col = QColor(100, 100, 100)
 
             painter.setPen(QPen(p_col, 1.5))
             painter.setBrush(QBrush(p_col))
-            # Hostile diamond
-            painter.drawPolygon([
-                painter.device().rect().topLeft() # dummy
-            ])
             painter.drawRect(px - 3, py - 3, 6, 6)
             painter.setFont(QFont("Consolas", 7))
             painter.drawText(px + 6, py + 3, f"#{tid}")
 
 
-# Modern Authentication Dialog
 class LoginDialog(QDialog):
+    """Monochrome Defense Operator Authentication Dialog."""
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("LATTICE-CUAS // DEFENSE AUTHENTICATION")
+        self.setWindowTitle("MONOLITH-CUAS // DEFENSE AUTHENTICATION")
         self.setFixedSize(440, 260)
         self.setStyleSheet("""
             QDialog {
-                background-color: #06090F;
-                border: 1px solid #1E293B;
+                background-color: #050505;
+                border: 1px solid #333333;
             }
             QLabel {
-                color: #94A3B8;
-                font-family: 'Segoe UI';
+                color: #A3A3A3;
+                font-family: 'Consolas';
                 font-weight: 600;
                 font-size: 11px;
             }
             QLineEdit {
-                background-color: #111827;
-                color: #F8FAFC;
-                border: 1px solid #1E293B;
+                background-color: #121212;
+                color: #FFFFFF;
+                border: 1px solid #333333;
                 padding: 6px 10px;
                 font-family: 'Consolas';
                 font-size: 12px;
-                border-radius: 3px;
+                border-radius: 2px;
             }
             QLineEdit:focus {
-                border: 1px solid #0EA5E9;
+                border: 1px solid #FFFFFF;
             }
             QPushButton {
-                background-color: #0EA5E9;
-                color: #06090F;
+                background-color: #FFFFFF;
+                color: #000000;
                 border: none;
                 padding: 8px 16px;
-                font-family: 'Segoe UI';
+                font-family: 'Consolas';
                 font-weight: 700;
                 font-size: 12px;
-                border-radius: 3px;
+                border-radius: 2px;
             }
             QPushButton:hover {
-                background-color: #38BDF8;
+                background-color: #D4D4D4;
             }
         """)
 
@@ -207,9 +201,9 @@ class LoginDialog(QDialog):
         layout.setSpacing(12)
         layout.setContentsMargins(20, 20, 20, 20)
 
-        title = QLabel("LATTICE-CUAS OPERATOR ACCESS")
-        title.setFont(QFont("Segoe UI", 13, QFont.Bold))
-        title.setStyleSheet("color: #F8FAFC; letter-spacing: 1px;")
+        title = QLabel("MONOLITH-CUAS OPERATOR ACCESS")
+        title.setFont(QFont("Consolas", 12, QFont.Bold))
+        title.setStyleSheet("color: #FFFFFF; letter-spacing: 1px;")
         layout.addWidget(title)
 
         form = QFormLayout()
@@ -227,14 +221,14 @@ class LoginDialog(QDialog):
         layout.addWidget(login_btn)
 
 
-# Main Modern Desktop C2 Window
 class DesktopApp(QWidget):
+    """Monochrome Desktop Tactical Command Center."""
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("LATTICE-CUAS // Autonomous Air Defense & Counter-Swarm Command (v4.0)")
+        self.setWindowTitle("MONOLITH-CUAS // Autonomous Air Defense & Swarm C2 (v6.0)")
         self.setMinimumSize(1340, 860)
 
-        # AI Core, Sensors & Control
+        self.cuda_engine = get_cuda_engine()
         self.detector = DroneDetector(confidence_threshold=0.50, device="auto")
         self.classifier = DroneClassifierEngine(device="auto")
         self.trajectory_predictor = TrajectoryPredictor(history_len=30, forecast_steps=40, fps=30.0)
@@ -262,35 +256,35 @@ class DesktopApp(QWidget):
     def setup_ui(self):
         self.setStyleSheet("""
             QWidget {
-                background-color: #06090F;
-                color: #F8FAFC;
-                font-family: 'Segoe UI', sans-serif;
+                background-color: #000000;
+                color: #FFFFFF;
+                font-family: 'Consolas', 'Segoe UI', monospace;
             }
             QLabel {
-                color: #94A3B8;
+                color: #A3A3A3;
             }
             QPushButton {
-                background-color: #111827;
-                color: #F8FAFC;
-                border: 1px solid #1E293B;
+                background-color: #141414;
+                color: #FFFFFF;
+                border: 1px solid #333333;
                 padding: 6px 12px;
                 font-weight: 600;
                 font-size: 11px;
-                border-radius: 3px;
+                border-radius: 2px;
             }
             QPushButton:hover {
-                background-color: #1E293B;
-                border-color: #334155;
+                background-color: #262626;
+                border-color: #555555;
             }
             QMenuBar {
-                background-color: #0B101B;
-                color: #94A3B8;
-                border-bottom: 1px solid #1E293B;
+                background-color: #0A0A0A;
+                color: #A3A3A3;
+                border-bottom: 1px solid #262626;
                 font-size: 11px;
             }
             QMenuBar::item:selected {
-                background-color: #1E293B;
-                color: #F8FAFC;
+                background-color: #262626;
+                color: #FFFFFF;
             }
         """)
 
@@ -302,13 +296,13 @@ class DesktopApp(QWidget):
         self.login_page = QWidget()
         login_vbox = QVBoxLayout(self.login_page)
         login_vbox.setAlignment(Qt.AlignCenter)
-        t_lbl = QLabel("LATTICE-CUAS // AUTONOMOUS AIR DEFENSE")
-        t_lbl.setFont(QFont("Segoe UI", 18, QFont.Bold))
-        t_lbl.setStyleSheet("color: #F8FAFC; margin-bottom: 15px; letter-spacing: 1px;")
+        t_lbl = QLabel("MONOLITH-CUAS // AUTONOMOUS AIR DEFENSE")
+        t_lbl.setFont(QFont("Consolas", 16, QFont.Bold))
+        t_lbl.setStyleSheet("color: #FFFFFF; margin-bottom: 15px; letter-spacing: 2px;")
         login_vbox.addWidget(t_lbl)
 
         auth_btn = QPushButton("INITIATE DEFENSE AUTHENTICATION")
-        auth_btn.setFont(QFont("Segoe UI", 12, QFont.Bold))
+        auth_btn.setFont(QFont("Consolas", 12, QFont.Bold))
         auth_btn.setFixedSize(380, 44)
         auth_btn.clicked.connect(self.show_login_dialog)
         login_vbox.addWidget(auth_btn)
@@ -333,15 +327,18 @@ class DesktopApp(QWidget):
         act_sim.triggered.connect(self.start_simulation)
 
         sensor_menu = self.menu_bar.addMenu("SENSOR MODE")
-        act_eo = QAction("EO Daylight", self)
         act_flir_w = QAction("FLIR White-Hot", self)
         act_flir_b = QAction("FLIR Black-Hot", self)
-        sensor_menu.addAction(act_eo)
+        act_eo = QAction("EO Daylight (Grayscale)", self)
+        act_swir = QAction("SWIR Night Vision", self)
         sensor_menu.addAction(act_flir_w)
         sensor_menu.addAction(act_flir_b)
-        act_eo.triggered.connect(lambda: self.set_sensor_mode("EO_DAYLIGHT"))
+        sensor_menu.addAction(act_eo)
+        sensor_menu.addAction(act_swir)
         act_flir_w.triggered.connect(lambda: self.set_sensor_mode("FLIR_WHITE_HOT"))
         act_flir_b.triggered.connect(lambda: self.set_sensor_mode("FLIR_BLACK_HOT"))
+        act_eo.triggered.connect(lambda: self.set_sensor_mode("EO_DAYLIGHT"))
+        act_swir.triggered.connect(lambda: self.set_sensor_mode("SWIR_NIGHT_VISION"))
 
         main_vbox.setMenuBar(self.menu_bar)
 
@@ -349,15 +346,15 @@ class DesktopApp(QWidget):
         header = QHBoxLayout()
         self.operator_label = QLabel(f"OPERATOR: {self.user_name} | {self.user_profile}")
         self.operator_label.setFont(QFont("Consolas", 10, QFont.Bold))
-        self.operator_label.setStyleSheet("color: #F8FAFC;")
+        self.operator_label.setStyleSheet("color: #FFFFFF;")
 
         self.defcon_label = QLabel("DEFCON 1 // CRITICAL")
         self.defcon_label.setFont(QFont("Consolas", 10, QFont.Bold))
-        self.defcon_label.setStyleSheet("color: #F43F5E; padding: 2px 8px; border: 1px solid #F43F5E; background: rgba(244,63,94,0.1); border-radius: 3px;")
+        self.defcon_label.setStyleSheet("color: #000000; background: #FFFFFF; padding: 2px 8px; border: 1px solid #FFFFFF; border-radius: 2px;")
 
         self.time_label = QLabel()
         self.time_label.setFont(QFont("Consolas", 10))
-        self.time_label.setStyleSheet("color: #94A3B8;")
+        self.time_label.setStyleSheet("color: #A3A3A3;")
 
         header.addWidget(self.operator_label)
         header.addStretch()
@@ -375,7 +372,7 @@ class DesktopApp(QWidget):
         self.video_label = QLabel()
         self.video_label.setAlignment(Qt.AlignCenter)
         self.video_label.setMinimumSize(600, 440)
-        self.video_label.setStyleSheet("border: 1px solid #1E293B; background-color: #04070D; border-radius: 2px;")
+        self.video_label.setStyleSheet("border: 1px solid #262626; background-color: #000000; border-radius: 2px;")
         video_panel.layout.addWidget(self.video_label)
         grid.addWidget(video_panel, 0, 0, 2, 1)
 
@@ -384,21 +381,21 @@ class DesktopApp(QWidget):
 
         det_panel = DashboardPanel("AI THREAT CLASSIFICATION (IMM-UKF)")
         self.det_status_label = QLabel("STATUS: MULTI-TARGET SWARM TRACKING")
-        self.det_status_label.setFont(QFont("Segoe UI", 10, QFont.Bold))
-        self.det_status_label.setStyleSheet("color: #F8FAFC;")
+        self.det_status_label.setFont(QFont("Consolas", 10, QFont.Bold))
+        self.det_status_label.setStyleSheet("color: #FFFFFF;")
 
         self.first_det_label = QLabel("TARGET: #101-ALPHA [SUICIDE DRONE]")
         self.first_det_label.setFont(QFont("Consolas", 9))
-        self.first_det_label.setStyleSheet("color: #F43F5E;")
+        self.first_det_label.setStyleSheet("color: #FFFFFF;")
 
         self.det_preview = QLabel("LOCKING OPTICAL TARGET")
         self.det_preview.setAlignment(Qt.AlignCenter)
         self.det_preview.setFixedSize(140, 140)
-        self.det_preview.setStyleSheet("border: 1px solid #1E293B; background-color: #0B101B; border-radius: 3px;")
+        self.det_preview.setStyleSheet("border: 1px solid #262626; background-color: #0A0A0A; border-radius: 2px;")
 
         self.cls_result_label = QLabel("TYPE: SUICIDE DRONE (LOITERING)")
         self.cls_result_label.setFont(QFont("Consolas", 10, QFont.Bold))
-        self.cls_result_label.setStyleSheet("color: #F8FAFC;")
+        self.cls_result_label.setStyleSheet("color: #FFFFFF;")
 
         self.threat_score_bar = QProgressBar()
         self.threat_score_bar.setRange(0, 100)
@@ -407,17 +404,17 @@ class DesktopApp(QWidget):
         self.threat_score_bar.setFormat("SEVERITY: %v/100")
         self.threat_score_bar.setStyleSheet("""
             QProgressBar {
-                border: 1px solid #1E293B;
+                border: 1px solid #333333;
                 text-align: center;
-                background-color: #111827;
-                color: #F8FAFC;
+                background-color: #141414;
+                color: #000000;
                 font-family: 'Consolas';
                 font-weight: bold;
                 border-radius: 2px;
                 height: 18px;
             }
             QProgressBar::chunk {
-                background-color: #F43F5E;
+                background-color: #FFFFFF;
             }
         """)
 
@@ -429,23 +426,24 @@ class DesktopApp(QWidget):
         mid_layout.addWidget(det_panel)
 
         # Effector Matrix
-        ecm_panel = DashboardPanel("EFFECTOR CONTROL MATRIX (WTA)")
+        ecm_panel = DashboardPanel("EFFECTOR CONTROL MATRIX (HOTL WTA)")
         ecm_grid = QGridLayout()
 
-        self.btn_rf_jam = QPushButton("ENGAGE RF JAMMER [2.4/5.8G]")
+        self.btn_rf_jam = QPushButton("ENGAGE RF JAMMER")
         self.btn_rf_jam.clicked.connect(self.trigger_rf_jam)
-        self.btn_rf_jam.setStyleSheet("border-color: #F59E0B; color: #F59E0B; background: rgba(245,158,11,0.1);")
+        self.btn_rf_jam.setStyleSheet("border-color: #FFFFFF; color: #FFFFFF; background: #1A1A1A;")
 
         self.btn_gps_spoof = QPushButton("ACTIVATE GNSS SPOOFING")
         self.btn_gps_spoof.clicked.connect(self.trigger_gps_spoof)
-        self.btn_gps_spoof.setStyleSheet("border-color: #0EA5E9; color: #0EA5E9; background: rgba(14,165,233,0.1);")
+        self.btn_gps_spoof.setStyleSheet("border-color: #FFFFFF; color: #FFFFFF; background: #1A1A1A;")
 
         self.btn_kinetic = QPushButton("LAUNCH KINETIC INTERCEPTOR")
         self.btn_kinetic.clicked.connect(self.trigger_kinetic)
-        self.btn_kinetic.setStyleSheet("border-color: #F43F5E; color: #F43F5E; background: rgba(244,63,94,0.15);")
+        self.btn_kinetic.setStyleSheet("border-color: #FFFFFF; color: #000000; background: #FFFFFF; font-weight: bold;")
 
         self.btn_standby = QPushButton("CEASEFIRE // ALL STANDBY")
         self.btn_standby.clicked.connect(self.disengage_countermeasures)
+        self.btn_standby.setStyleSheet("border-color: #555555; color: #888888; background: #0A0A0A;")
 
         ecm_grid.addWidget(self.btn_rf_jam, 0, 0)
         ecm_grid.addWidget(self.btn_gps_spoof, 0, 1)
@@ -455,7 +453,7 @@ class DesktopApp(QWidget):
 
         self.ecm_status_label = QLabel("EFFECTORS: ALL SYSTEMS IN READY POSTURE")
         self.ecm_status_label.setFont(QFont("Consolas", 8))
-        self.ecm_status_label.setStyleSheet("color: #94A3B8;")
+        self.ecm_status_label.setStyleSheet("color: #A3A3A3;")
         ecm_panel.layout.addWidget(self.ecm_status_label)
         mid_layout.addWidget(ecm_panel)
 
@@ -471,7 +469,7 @@ class DesktopApp(QWidget):
         ledger_panel = DashboardPanel("FORENSIC LEDGER (SHA-256)")
         self.ledger_txt = QLabel("CHAIN INTEGRITY: 100% VERIFIED\nLAST BLOCK: #8f3a...9c12\nIMM-UKF 3D KINEMATICS ACTIVE")
         self.ledger_txt.setFont(QFont("Consolas", 8))
-        self.ledger_txt.setStyleSheet("color: #0EA5E9; line-height: 1.4;")
+        self.ledger_txt.setStyleSheet("color: #FFFFFF; line-height: 1.4;")
         ledger_panel.layout.addWidget(self.ledger_txt)
         right_layout.addWidget(ledger_panel)
 
@@ -485,7 +483,7 @@ class DesktopApp(QWidget):
 
         self.lbl_cpu = QLabel("CPU: 0%")
         self.lbl_mem = QLabel("MEM: 0%")
-        self.lbl_gpu = QLabel("GPU: RTX 3050")
+        self.lbl_gpu = QLabel(f"GPU: {self.cuda_engine.device_name}")
         self.lbl_fps = QLabel("FPS: 30.0")
         self.lbl_lat = QLabel("LATENCY: 28 ms")
         self.lbl_rf = QLabel("RF SENSOR: 2.4/5.8 GHz FHSS")
@@ -493,7 +491,7 @@ class DesktopApp(QWidget):
 
         for lab in [self.lbl_cpu, self.lbl_mem, self.lbl_gpu, self.lbl_fps, self.lbl_lat, self.lbl_rf, self.lbl_threats]:
             lab.setFont(QFont("Consolas", 9, QFont.Bold))
-            lab.setStyleSheet("color: #94A3B8;")
+            lab.setStyleSheet("color: #A3A3A3;")
             metrics_h.addWidget(lab)
 
         metrics_panel.layout.addLayout(metrics_h)
@@ -586,8 +584,8 @@ class DesktopApp(QWidget):
 
             radar_ui_contacts.append((bearing_deg, dist_m / 3500.0, threat_eval.threat_level, trk.target_id))
 
-            # Render corner brackets and lead reticle
-            col = (94, 63, 244) if threat_eval.geofence_zone == "RED" else (11, 158, 245)
+            # Monochrome brackets & lead reticle
+            col = (255, 255, 255) if threat_eval.geofence_zone == "RED" else (160, 160, 160)
             draw_corner_brackets(frame, trk.bbox, col, thickness=1)
             draw_lead_reticle(frame, (cx, cy), lead_vector=(traj.velocity_vector[0]*0.5, traj.velocity_vector[1]*0.5))
 
@@ -611,7 +609,6 @@ class DesktopApp(QWidget):
             self._last_fps = (len(self._frame_times) - 1) / (self._frame_times[-1] - self._frame_times[0])
         self._last_latency = int(dt * 1000)
 
-        # Scale and render frame
         rgb_frame = cv2.cvtColor(cv2.resize(frame, (600, 440)), cv2.COLOR_BGR2RGB)
         qimg = QImage(rgb_frame.data, 600, 440, rgb_frame.strides[0], QImage.Format_RGB888)
         self.video_label.setPixmap(QPixmap.fromImage(qimg))
@@ -650,6 +647,9 @@ class DesktopApp(QWidget):
             self.lbl_mem.setText(f"MEM: {int(psutil.virtual_memory().percent)}%")
             self.lbl_fps.setText(f"FPS: {self._last_fps:.1f}")
             self.lbl_lat.setText(f"LATENCY: {self._last_latency} ms")
+            gpu_tel = self.cuda_engine.get_telemetry()
+            if gpu_tel.get("is_cuda"):
+                self.lbl_gpu.setText(f"GPU: {gpu_tel.get('device_name', 'CUDA')} ({gpu_tel.get('vram_used_mb', 0)}MB)")
         except Exception:
             pass
 

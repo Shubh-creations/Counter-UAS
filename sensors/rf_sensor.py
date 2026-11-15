@@ -1,8 +1,10 @@
 """
-Radio Frequency (RF) Signal Detection, High-Resolution SDR Waterfall & Direction Finding (v4.0-Lattice).
-Models software-defined radio (SDR) capturing 128-bin FFT Power Spectral Density (PSD) waterfall arrays
-across 2.4 GHz, 5.8 GHz, and 900 MHz / 433 MHz bands.
-Computes Angle of Arrival (AoA) bearing lobing and detects frequency-hopping (FHSS) telemetry anomalies.
+Radio Frequency (RF) Signal Detection, High-Resolution SDR Waterfall & Direction Finding (v6.0-MONOLITH).
+Features:
+- Multi-channel software-defined radio (SDR) capturing 128-bin FFT Power Spectral Density (PSD) waterfalls.
+- CUDA-accelerated torch.fft.rfft baseband signal processing.
+- Multi-band coverage across 2.4 GHz, 5.8 GHz, and 900 MHz / 433 MHz bands.
+- Angle of Arrival (AoA) bearing lobing and frequency-hopping (FHSS) telemetry anomaly detection.
 """
 
 from dataclasses import dataclass, field
@@ -11,10 +13,13 @@ import math
 import random
 import time
 import numpy as np
+import torch
 
 from utils.logger import get_logger
+from utils.cuda_runtime import get_cuda_engine
 
 logger = get_logger("CUAS.RFSensor")
+
 
 @dataclass
 class RFEmission:
@@ -35,7 +40,7 @@ class RFEmission:
 class RFSensorSimulator:
     """
     High-Fidelity Multi-Channel SDR Receiver & Direction Finding (DF) Array.
-    Generates 128-bin Power Spectral Density (PSD) waterfalls and AoA bearing lobes.
+    Generates 128-bin Power Spectral Density (PSD) waterfalls via CUDA torch.fft.rfft.
     """
     def __init__(
         self,
@@ -46,6 +51,7 @@ class RFSensorSimulator:
         self.noise_floor_dbm = noise_floor_dbm
         self.last_scan_time = time.time()
         self.active_jammer_bands: List[str] = []
+        self.cuda_engine = get_cuda_engine()
 
     def set_jammer_active(self, active_bands: List[str]):
         """Simulates jammer saturation of RF waterfall when countermeasures are engaged."""
@@ -54,9 +60,61 @@ class RFSensorSimulator:
     def generate_waterfall_slice(self, center_freq_mhz: float = 2437.0, target_present: bool = True) -> List[float]:
         """
         Synthesizes a 128-bin FFT Power Spectral Density (PSD) array.
-        Includes Gaussian background thermal noise floor (-105 dBm) plus FHSS drone carrier peaks
-        or broadband jammer saturation.
+        Uses CUDA PyTorch torch.fft.rfft when available to process simulated I/Q baseband samples.
         """
+        if self.cuda_engine.is_cuda:
+            try:
+                device = self.cuda_engine.device
+                n_samples = 256
+                # Base Gaussian thermal noise on GPU
+                noise_real = torch.randn(n_samples, device=device) * 0.05
+                noise_imag = torch.randn(n_samples, device=device) * 0.05
+
+                # Check jammer saturation
+                is_jammed = any("2.4" in b for b in self.active_jammer_bands) or any("JAM" in b for b in self.active_jammer_bands)
+
+                if is_jammed:
+                    # Broadband high-power jamming noise
+                    jam_real = torch.randn(n_samples, device=device) * 8.0
+                    jam_imag = torch.randn(n_samples, device=device) * 8.0
+                    iq_samples = torch.complex(noise_real + jam_real, noise_imag + jam_imag)
+                elif target_present:
+                    t = torch.linspace(0, 1, n_samples, device=device)
+                    # OFDM subcarriers (sinc-like pulse envelope)
+                    f_carrier = 0.25  # Normalized frequency
+                    carrier = torch.exp(2j * math.pi * f_carrier * t * 64) * 0.8
+                    # Fast FHSS hopping spike
+                    hop_freq = float(random.uniform(0.1, 0.45))
+                    hop_tone = torch.exp(2j * math.pi * hop_freq * t * 128) * 1.5
+                    iq_samples = torch.complex(noise_real, noise_imag) + carrier + hop_tone
+                else:
+                    iq_samples = torch.complex(noise_real, noise_imag)
+
+                # Compute CUDA FFT
+                fft_vals = torch.fft.rfft(iq_samples)
+                power = torch.clamp(fft_vals.abs() ** 2, min=1e-12)
+                psd_raw = 10.0 * torch.log10(power)
+
+                # Interpolate to 128 bins
+                psd_128 = torch.nn.functional.interpolate(
+                    psd_raw.unsqueeze(0).unsqueeze(0),
+                    size=128,
+                    mode="linear",
+                    align_corners=False
+                ).squeeze().cpu().numpy()
+
+                if is_jammed:
+                    calibrated = np.clip(psd_128 - 25.0, -45.0, -25.0)
+                elif target_present:
+                    calibrated = np.clip(psd_128 - 50.0, self.noise_floor_dbm, -38.0)
+                else:
+                    calibrated = np.clip(psd_128 - 70.0, self.noise_floor_dbm, -92.0)
+
+                return [round(float(v), 1) for v in calibrated]
+            except Exception as e:
+                logger.debug(f"CUDA FFT failed, using fallback: {e}")
+
+        # NumPy CPU Fallback
         bins = np.random.normal(self.noise_floor_dbm, 2.0, 128)
 
         # If jammer active on this band, flood the spectrum with white noise
@@ -95,42 +153,33 @@ class RFSensorSimulator:
         if is_rf_silent or simulated_target_bearing is None or distance_m is None or distance_m > 4200.0:
             return emissions
 
-        # Free-Space Path Loss (FSPL) model
-        # FSPL(dB) = 20*log10(d) + 20*log10(f_MHz) - 27.55
+        # Free-Space Path Loss (FSPL) model: FSPL(dB) = 20*log10(d) + 20*log10(f_MHz) - 27.55
         freq_mhz = 2437.0 if "2.4" in target_protocol or "Ocu" in target_protocol else 5805.0
-        fspl_db = 20.0 * math.log10(max(10.0, distance_m)) + 20.0 * math.log10(freq_mhz) - 27.55
-        tx_power_dbm = 23.0 # Standard 200mW transmitter
-        rx_antenna_gain_db = 14.0 # High-gain directional array
-        rssi = tx_power_dbm + rx_antenna_gain_db - fspl_db + random.uniform(-1.5, 1.5)
-        rssi = max(-102.0, min(-28.0, rssi))
+        fspl = 20.0 * math.log10(max(10.0, distance_m)) + 20.0 * math.log10(freq_mhz) - 27.55
+        tx_power_dbm = 26.0  # +26 dBm EIRP (~400 mW typical drone transmitter)
+        rx_rssi = round(tx_power_dbm - fspl + random.uniform(-2.5, 2.5), 1)
 
-        snr = rssi - self.noise_floor_dbm
-        # Angle of Arrival (AoA) bearing lobing with variance proportional to 1/SNR
-        aoa_std_deg = max(0.5, min(6.0, 25.0 / max(1.0, snr)))
-        aoa_bearing = (simulated_target_bearing + random.gauss(0.0, aoa_std_deg)) % 360.0
+        if rx_rssi > self.noise_floor_dbm:
+            snr = round(rx_rssi - self.noise_floor_dbm, 1)
+            bearing_error = random.gauss(0.0, 1.8)
+            measured_bearing = round((simulated_target_bearing + bearing_error) % 360.0, 1)
 
-        waterfall_psd = self.generate_waterfall_slice(center_freq_mhz=freq_mhz, target_present=True)
+            waterfall = self.generate_waterfall_slice(center_freq_mhz=freq_mhz, target_present=True)
 
-        oui_map = {
-            "OcuSync-3": "60:60:1F (DJI Enterprise)",
-            "ExpressLRS": "AC:87:A3 (ExpressLRS OpenTX)",
-            "TBS-Crossfire": "94:B4:0F (TBS BlackSheep)",
-            "MAVLink": "00:1B:C5 (Telemetry Radio)"
-        }
+            emission = RFEmission(
+                frequency_mhz=freq_mhz,
+                bandwidth_mhz=20.0 if "Ocu" in target_protocol else 10.0,
+                rssi_dbm=rx_rssi,
+                snr_db=snr,
+                protocol=target_protocol,
+                mac_address_oui="60:60:1F (DJI)" if "Ocu" in target_protocol else "00:1B:44 (ELRS)",
+                bearing_deg=measured_bearing,
+                estimated_distance_m=round(distance_m * random.uniform(0.92, 1.08), 1),
+                detected_timestamp=now,
+                is_frequency_hopping=True,
+                hop_rate_hops_per_sec=250.0,
+                waterfall_psd_bin_128=waterfall
+            )
+            emissions.append(emission)
 
-        emission = RFEmission(
-            frequency_mhz=freq_mhz,
-            bandwidth_mhz=20.0,
-            rssi_dbm=round(rssi, 1),
-            snr_db=round(snr, 1),
-            protocol=target_protocol,
-            mac_address_oui=oui_map.get(target_protocol, "UNKNOWN (Proprietary FHSS)"),
-            bearing_deg=round(aoa_bearing, 1),
-            estimated_distance_m=round(distance_m * random.uniform(0.92, 1.08), 1),
-            detected_timestamp=now,
-            is_frequency_hopping=True,
-            hop_rate_hops_per_sec=250.0 if "ExpressLRS" in target_protocol else 100.0,
-            waterfall_psd_bin_128=waterfall_psd
-        )
-        emissions.append(emission)
         return emissions

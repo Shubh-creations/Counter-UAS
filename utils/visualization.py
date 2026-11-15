@@ -1,8 +1,8 @@
 """
-Tactical Symbology & Military HUD Rendering Utilities (v4.0-Lattice).
-Adheres to modern defense C2 design standards (Anduril Lattice / Palantir Gotham / MIL-STD-2525D).
-Zero retro-neon styling. Features precision hairlines, lead-computing reticles, covariance uncertainty ellipses,
-pitch/roll attitude ladders, and NATO symbology.
+Tactical Symbology & Military HUD Rendering Utilities (v6.0-MONOLITH).
+Adheres strictly to the 1000% Achromatic Monochrome Design Standard (#000000 to #FFFFFF).
+Zero green, red, amber, blue, or neon colors. Precision hairlines, lead-computing reticles,
+covariance uncertainty ellipses, attitude ladders, and NATO symbology in pure grayscale.
 """
 
 from typing import List, Tuple, Optional, Dict, Any
@@ -10,15 +10,16 @@ import math
 import cv2
 import numpy as np
 
-# Semantic Tactical Color Palette (BGR format for OpenCV)
-COLOR_HOSTILE_CRIMSON = (94, 63, 244)     # #F43F5E (Hostile / Critical)
-COLOR_SUSPECT_AMBER    = (11, 158, 245)    # #F59E0B (Suspect / Elevated)
-COLOR_FRIENDLY_CYAN    = (233, 165, 14)    # #0EA5E9 (Blue Force / Interceptor)
-COLOR_NOMINAL_EMERALD  = (129, 185, 16)    # #10B981 (Nominal / Safe)
-COLOR_SLATE_WHITE      = (250, 250, 248)   # #F8FAFC (Primary Telemetry)
-COLOR_SLATE_MUTED      = (184, 163, 148)   # #94A3B8 (Labels)
-COLOR_DARK_SURFACE     = (27, 16, 11)      # #0B101B (Card / Panel)
-COLOR_BORDER_HAIRLINE  = (59, 41, 30)      # #1E293B (Crisp Hairline)
+# Strict Achromatic Monochrome Tactical Palette (BGR format for OpenCV)
+COLOR_HOSTILE_CRIMSON = (255, 255, 255)   # Inverted High-Contrast Pure White (#FFFFFF)
+COLOR_SUSPECT_AMBER    = (210, 210, 210)   # Bright Silver (#D2D2D2)
+COLOR_FRIENDLY_CYAN    = (160, 160, 160)   # Mid Silver (#A0A0A0)
+COLOR_NOMINAL_EMERALD  = (110, 110, 110)   # Gunmetal Gray (#6E6E6E)
+COLOR_SLATE_WHITE      = (255, 255, 255)   # Pure Phosphor White (#FFFFFF)
+COLOR_SLATE_MUTED      = (140, 140, 140)   # Muted Silver (#8C8C8C)
+COLOR_DARK_SURFACE     = (14, 14, 14)      # Deep Obsidian Surface (#0E0E0E)
+COLOR_BORDER_HAIRLINE  = (40, 40, 40)      # Crisp Monochrome Border (#282828)
+
 
 def draw_corner_brackets(
     img: np.ndarray,
@@ -105,7 +106,7 @@ def render_military_hud(
     system_metrics: Dict[str, Any],
     threat_summary: Dict[str, Any]
 ) -> np.ndarray:
-    """Overlays clean defense C2 telemetry onto frame."""
+    """Overlays clean defense C2 telemetry onto frame in strict monochrome."""
     hud = frame.copy()
     h, w = hud.shape[:2]
     fps = system_metrics.get("fps", 30.0)
@@ -113,7 +114,7 @@ def render_military_hud(
     lvl = threat_summary.get("threat_level", "SAFE")
     trks = threat_summary.get("active_threats", 0)
 
-    cv2.putText(hud, f"LATTICE-C2 // FPS: {fps:.1f} | LAT: {lat}ms", (14, 24),
+    cv2.putText(hud, f"MONOLITH-C2 // FPS: {fps:.1f} | LAT: {lat}ms", (14, 24),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, COLOR_SLATE_WHITE, 1, cv2.LINE_AA)
     col = COLOR_HOSTILE_CRIMSON if lvl in ["CRITICAL", "HIGH"] else COLOR_NOMINAL_EMERALD
     cv2.putText(hud, f"DEFCON: {lvl} [{trks} TRKS]", (w - 220, 24),

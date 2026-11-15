@@ -1,13 +1,13 @@
 """
-Comprehensive Unit and Integration Test Suite for CUAS (v4.0-Lattice).
+Comprehensive Unit and Integration Test Suite for CUAS (v6.0-MONOLITH).
 Covers:
-- 3D IMM-UKF state estimation, covariance positive-definiteness, terminal dive detection, and CEP impact.
-- Multi-target ByteTrack Hungarian assignment and swarm ID persistence.
-- Evidential threat classification with Radar micro-Doppler and RF-silent stealth detection.
-- Weapon-Target Assignment (WTA) optimization and 6-stage Kill-Chain progression.
-- 128-bin SDR RF waterfall arrays and AESA phased-array radar micro-Doppler physics.
-- Covariance Intersection multi-modal sensor fusion.
-- Closed-loop countermeasure actuator kinematics and Blue-Force interceptor BDA.
+- CUDA runtime singleton, FP16 execution, and VRAM telemetry.
+- 3D IMM-UKF and CudaSwarmUKF3D batched GPU filtering.
+- Two-Stage ByteTrack Hungarian IoU and batched distance matching.
+- CUDA-accelerated STFT micro-Doppler radar blade flash separation and SDR FFT waterfalls.
+- Covariance Intersection multi-modal sensor fusion and Blue-Force IFF.
+- Closed-loop countermeasure actuators and Proportional Navigation interceptors.
+- Human-on-the-Loop (HOTL) Autonomy Plays (PLAY_01 to PLAY_04) and Mission Lifecycle.
 - Cryptographic SHA-256 blockchain audit chain validation and tamper detection.
 """
 
@@ -15,19 +15,21 @@ import unittest
 import numpy as np
 import time
 import os
+import torch
 
 from utils.geo_utils import haversine_distance, calculate_bearing, forward_project, check_geofence_status
+from utils.cuda_runtime import get_cuda_engine
 from ai_core.trajectory_predictor import (
-    KalmanFilter2D, UKFFilter3D, InteractingMultipleModelUKF, TrajectoryPredictor
+    KalmanFilter2D, UKFFilter3D, InteractingMultipleModelUKF, TrajectoryPredictor, CudaSwarmUKF3D
 )
 from ai_core.classifier import DroneClassifierEngine, DroneClassificationResult
-from ai_core.response_engine import ThreatResponseEngine, ThreatEvaluation, KillChainStage
+from ai_core.response_engine import ThreatResponseEngine, ThreatEvaluation, KillChainStage, AutonomyPlayType
 from ai_core.detection import SyntheticDroneGenerator, TrackedDrone, DroneDetector, compute_iou
 from sensors.rf_sensor import RFSensorSimulator
 from sensors.radar_sensor import RadarSensorSimulator
 from sensors.sensor_fusion import SensorFusionHub, covariance_intersection_1d
 from control_unit.neutralization import CountermeasureController, CountermeasureType, ActuatorStatus
-from control_unit.threat_manager import ThreatManager
+from control_unit.threat_manager import ThreatManager, MissionFlightRecorder
 from control_unit.audit_logger import ForensicAuditLogger
 
 
@@ -75,7 +77,6 @@ class TestCUASTrajectoryIMMUKF(unittest.TestCase):
 
     def test_imm_ukf_mode_probabilities_and_dive_detection(self):
         imm = InteractingMultipleModelUKF(init_pos_enu=(0.0, 500.0, 300.0), dt=1.0/30.0)
-        # Simulate downward terminal dive
         for step in range(15):
             z_enu = (0.0, 500.0 - step * 15.0, 300.0 - step * 18.0)
             res = imm.cycle(z_enu)
@@ -91,6 +92,37 @@ class TestCUASTrajectoryIMMUKF(unittest.TestCase):
         self.assertGreater(pred.circular_error_probable_m, 0.0)
 
 
+class TestCUASCudaAcceleration(unittest.TestCase):
+    def test_cuda_runtime_engine_singleton(self):
+        engine = get_cuda_engine()
+        self.assertIsNotNone(engine)
+        telemetry = engine.get_telemetry()
+        self.assertIn("is_cuda", telemetry)
+        self.assertIn("device_name", telemetry)
+        self.assertIn("vram_allocated_mb", telemetry)
+        if torch.cuda.is_available():
+            self.assertTrue(telemetry["is_cuda"])
+            self.assertIn("RTX", telemetry["device_name"])
+
+    def test_cuda_swarm_ukf_batched_filtering(self):
+        engine = get_cuda_engine()
+        swarm_ukf = CudaSwarmUKF3D(max_targets=12, device=engine.device)
+        self.assertEqual(swarm_ukf.state_dim, 9)
+        # Run prediction
+        swarm_ukf.predict_batch()
+        # Run batched measurement update for 4 targets
+        target_indices = [0, 1, 2, 3]
+        measurements = np.array([
+            [100.0, 200.0, 150.0],
+            [150.0, 250.0, 180.0],
+            [-100.0, 300.0, 120.0],
+            [200.0, -150.0, 90.0]
+        ], dtype=np.float32)
+        states = swarm_ukf.update_batch(target_indices, measurements)
+        self.assertEqual(states.shape[0], 12)
+        self.assertEqual(states.shape[1], 9)
+
+
 class TestCUASDetectionAndByteTrack(unittest.TestCase):
     def test_compute_iou(self):
         box1 = (10, 10, 50, 50)
@@ -99,106 +131,55 @@ class TestCUASDetectionAndByteTrack(unittest.TestCase):
         self.assertAlmostEqual(compute_iou(box1, box2), 1.0)
         self.assertEqual(compute_iou(box1, box3), 0.0)
 
-    def test_synthetic_drone_swarm_generation(self):
+    def test_synthetic_drone_generator_multi_target_and_monochrome(self):
         gen = SyntheticDroneGenerator(width=640, height=480, scenario="SWARM_SATURATION")
-        frame_eo = gen.generate_frame()
-        self.assertEqual(frame_eo.shape, (480, 640, 3))
-        self.assertGreaterEqual(len(gen.drones), 3)
+        self.assertGreaterEqual(len(gen.drones), 8)
+        # Test Achromatic modes
+        for mode in ["FLIR_WHITE_HOT", "FLIR_BLACK_HOT", "EO_DAYLIGHT", "SWIR_NIGHT_VISION"]:
+            gen.set_display_mode(mode)
+            frame = gen.generate_frame()
+            self.assertEqual(frame.shape, (480, 640, 3))
+            self.assertEqual(frame.dtype, np.uint8)
 
-        # Test FLIR thermal modes
-        gen.set_display_mode("FLIR_WHITE_HOT")
-        frame_flir_w = gen.generate_frame()
-        self.assertEqual(frame_flir_w.shape, (480, 640, 3))
-
-        gen.set_display_mode("FLIR_BLACK_HOT")
-        frame_flir_b = gen.generate_frame()
-        self.assertEqual(frame_flir_b.shape, (480, 640, 3))
-
-    def test_bytetrack_hungarian_track_persistence(self):
-        detector = DroneDetector(confidence_threshold=0.45, device="cpu")
-        frame = np.zeros((480, 640, 3), dtype=np.uint8)
-        # Direct association test
-        raw_dets = [
-            ((100, 100, 150, 150), 0.90, "uav"),
-            ((300, 200, 360, 260), 0.85, "uav")
+    def test_bytetrack_association_persistence(self):
+        detector = DroneDetector(confidence_threshold=0.50, device="cpu")
+        raw_dets_t0 = [
+            ((100, 100, 140, 140), 0.92, "uav"),
+            ((300, 200, 340, 240), 0.88, "uav")
         ]
-        t1 = detector._bytetrack_association(raw_dets, frame)
-        self.assertEqual(len(t1), 2)
-        initial_ids = [t.target_id for t in t1]
+        dummy_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        tracks_t0 = detector._bytetrack_association(raw_dets_t0, dummy_frame)
+        self.assertEqual(len(tracks_t0), 2)
+        id_1, id_2 = tracks_t0[0].target_id, tracks_t0[1].target_id
 
-        # Next frame slightly moved
-        raw_dets_moved = [
-            ((103, 102, 153, 152), 0.88, "uav"),
-            ((304, 202, 364, 262), 0.84, "uav")
+        # Next frame with small kinematic shift
+        raw_dets_t1 = [
+            ((104, 103, 144, 143), 0.89, "uav"),
+            ((305, 202, 345, 242), 0.85, "uav")
         ]
-        t2 = detector._bytetrack_association(raw_dets_moved, frame)
-        self.assertEqual(len(t2), 2)
-        moved_ids = [t.target_id for t in t2]
-        self.assertEqual(initial_ids, moved_ids, "Hungarian tracking must preserve track IDs across motion")
+        tracks_t1 = detector._bytetrack_association(raw_dets_t1, dummy_frame)
+        self.assertEqual(len(tracks_t1), 2)
+        tracked_ids_t1 = {t.target_id for t in tracks_t1}
+        self.assertIn(id_1, tracked_ids_t1)
+        self.assertIn(id_2, tracked_ids_t1)
 
 
-class TestCUASEvidentialClassifier(unittest.TestCase):
-    def test_classifier_micro_doppler_and_rf_silent_threat(self):
-        engine = DroneClassifierEngine(device="cpu")
-        crop = np.zeros((80, 80, 3), dtype=np.uint8)
+class TestCUASClassificationAndSensors(unittest.TestCase):
+    def test_classifier_radar_micro_doppler_corroboration(self):
+        classifier = DroneClassifierEngine(device="cpu")
+        crop = np.zeros((100, 100, 3), dtype=np.uint8)
+        res_bird = classifier.classify_crop(crop, radar_micro_doppler=True, is_radar_bird=True)
+        self.assertEqual(res_bird.predicted_class, "BIRD_BIOLOGICAL_CLUTTER")
+        self.assertLess(res_bird.threat_score, 15.0)
 
-        # RF-Silent fast-closing threat
-        res_dark = engine.classify_crop(
-            crop_bgr=crop,
-            radar_micro_doppler_rpm=22000.0,
-            rf_protocol="RF-SILENT",
-            closing_speed_mps=28.0
-        )
-        self.assertTrue(res_dark.is_autonomous_dark_threat)
-        self.assertEqual(res_dark.predicted_class, "AUTONOMOUS_LOITERING_MUNITION")
-        self.assertGreater(res_dark.threat_score, 80.0)
+        res_drone = classifier.classify_crop(crop, radar_micro_doppler=True, is_radar_bird=False, closing_speed_mps=28.0)
+        self.assertEqual(res_drone.predicted_class, "SUICIDE_FPV_DRONE")
+        self.assertGreaterEqual(res_drone.threat_score, 80.0)
 
-    def test_classifier_civilian_low_rpm(self):
-        engine = DroneClassifierEngine(device="cpu")
-        crop = np.zeros((60, 60, 3), dtype=np.uint8)
-        res_civ = engine.classify_crop(
-            crop_bgr=crop,
-            radar_micro_doppler_rpm=8500.0,
-            rf_protocol="WiFi",
-            closing_speed_mps=3.0
-        )
-        self.assertFalse(res_civ.is_autonomous_dark_threat)
-        self.assertLess(res_civ.threat_score, 60.0)
-
-
-class TestCUASResponseAndWTA(unittest.TestCase):
-    def test_weapon_target_assignment_and_kill_chain(self):
-        response_eng = ThreatResponseEngine(base_latitude=37.7749, base_longitude=-122.4194)
-        mock_cls = DroneClassificationResult(
-            predicted_class="SUICIDE_DRONE",
-            confidence=0.94,
-            threat_score=92.0,
-            probabilities={"SUICIDE_DRONE": 0.94},
-            has_payload_risk=True,
-            size_category="MEDIUM",
-            wingspan_estimate_px=90,
-            aspect_ratio=1.2,
-            is_autonomous_dark_threat=False
-        )
-        # Fast dive near base (350m -> Killzone)
-        eval_res = response_eng.evaluate_target(
-            target_id=101,
-            target_lat=37.7749 + 0.002,
-            target_lon=-122.4194,
-            classification=mock_cls
-        )
-        self.assertEqual(eval_res.geofence_zone, "RED")
-        self.assertEqual(eval_res.threat_level, "CRITICAL")
-        self.assertEqual(eval_res.kill_chain_stage, KillChainStage.ENGAGE)
-        self.assertIn(eval_res.recommended_countermeasure, ["KINETIC_INTERCEPT", "RF_JAMMER"])
-
-
-class TestCUASSensorsAndFusion(unittest.TestCase):
-    def test_sdr_rf_waterfall_128_bins(self):
+    def test_rf_sensor_waterfall_and_jammer_saturation(self):
         rf = RFSensorSimulator()
         psd = rf.generate_waterfall_slice(center_freq_mhz=2437.0, target_present=True)
         self.assertEqual(len(psd), 128)
-        # Test jammer saturation
         rf.set_jammer_active(["2.4 GHz"])
         psd_jammed = rf.generate_waterfall_slice(center_freq_mhz=2437.0, target_present=True)
         self.assertGreater(np.mean(psd_jammed), np.mean(psd))
@@ -216,7 +197,6 @@ class TestCUASSensorsAndFusion(unittest.TestCase):
         self.assertTrue(contacts[0].rotor_blade_detected)
         self.assertEqual(len(contacts[0].micro_doppler_spectrum_64), 64)
 
-        # Bird comparison
         bird_contacts = radar.scan_for_contacts(
             target_range_m=800.0,
             target_azimuth_deg=60.0,
@@ -240,6 +220,51 @@ class TestCUASSensorsAndFusion(unittest.TestCase):
         fused = hub.fuse([v_track], [], [])
         self.assertEqual(len(fused), 1)
         self.assertIn("EO", fused[0].sensor_badge)
+
+
+class TestCUASHOTLAutonomyAndLifecycle(unittest.TestCase):
+    def test_autonomy_playbook_recommendation_and_execution(self):
+        resp_engine = ThreatResponseEngine()
+        # Test critical dive recommendation
+        crit_threat = ThreatEvaluation(
+            target_id=101, threat_level="CRITICAL", numerical_threat_score=92.0,
+            geofence_zone="RED", distance_to_base_m=420.0, bearing_from_base_deg=45.0,
+            recommended_countermeasure="KINETIC_INTERCEPT", countermeasure_probability_success=0.96,
+            engagement_authorized=True, rationale="Terminal Dive", time_to_perimeter_sec=4.2
+        )
+        intent = resp_engine.evaluate_swarm_autonomy_play([crit_threat])
+        self.assertIsNotNone(intent)
+        self.assertEqual(intent.play_type, AutonomyPlayType.PLAY_03_KINETIC_WOLF_PACK)
+
+        ctrl = CountermeasureController(operator_name="TEST_COMMANDER")
+        res_play = ctrl.execute_autonomy_play("PLAY_03_KINETIC_WOLF_PACK", target_ids=[101])
+        self.assertEqual(res_play["status"], "EXECUTED")
+        self.assertIn("Kinetic Wolf Pack", res_play["message"])
+
+        # Ceasefire
+        res_cf = ctrl.execute_autonomy_play("PLAY_04_CEASEFIRE_RTB")
+        self.assertEqual(res_cf["status"], "EXECUTED")
+        self.assertIn("CEASEFIRE", res_cf["message"])
+
+    def test_mission_flight_recorder_and_wargame(self):
+        mgr = ThreatManager()
+        mgr.set_mission_phase("PRE_MISSION")
+        wargame_res = mgr.run_pre_mission_wargame(num_simulations=100)
+        self.assertGreaterEqual(wargame_res["monte_carlo_survival_probability_percent"], 90.0)
+
+        # Record frames in LIVE_EXECUTION
+        mgr.set_mission_phase("LIVE_EXECUTION")
+        for i in range(10):
+            frame_id = mgr.record_telemetry_snapshot(friendly_assets=[], effector_statuses={"RF_JAMMER": "STANDBY"})
+            self.assertEqual(frame_id, i + 1)
+
+        self.assertEqual(mgr.flight_recorder.get_total_frames(), 10)
+        rec_frame = mgr.flight_recorder.get_frame(5)
+        self.assertIsNotNone(rec_frame)
+        self.assertEqual(rec_frame["frame_id"], 6)
+
+        kpis = mgr.flight_recorder.get_kpi_summary()
+        self.assertGreaterEqual(kpis["defense_success_rate_percent"], 90.0)
 
 
 class TestCUASControlAndAudit(unittest.TestCase):

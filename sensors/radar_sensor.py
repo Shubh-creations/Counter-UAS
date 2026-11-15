@@ -1,8 +1,9 @@
 """
-3D Phased-Array Pulse-Doppler Radar & Micro-Doppler Blade Flash Simulator (v4.0-Lattice).
-Models an electronic-scan active electronically steered array (AESA) operating at 20 Hz track-while-scan.
-Synthesizes Micro-Doppler rotor blade harmonic spectrograms to reliably separate
-drones (high-RPM symmetric harmonics) from biological clutter (low-frequency flapping birds).
+3D Phased-Array Pulse-Doppler Radar & Micro-Doppler Blade Flash Simulator (v6.0-MONOLITH).
+Features:
+- Electronic-scan active electronically steered array (AESA) operating at 20 Hz track-while-scan.
+- CUDA-accelerated torch.stft Micro-Doppler rotor blade harmonic spectrogram processing.
+- Symmetric harmonic separation for drone identification vs low-frequency biological clutter.
 """
 
 from dataclasses import dataclass, field
@@ -11,10 +12,13 @@ import math
 import random
 import time
 import numpy as np
+import torch
 
 from utils.logger import get_logger
+from utils.cuda_runtime import get_cuda_engine
 
 logger = get_logger("CUAS.Radar")
+
 
 @dataclass
 class RadarContact:
@@ -27,7 +31,6 @@ class RadarContact:
     rotor_blade_detected: bool                 # Micro-Doppler modulation detected
     snr_db: float
     timestamp: float
-    # v4.0-Lattice Micro-Doppler & Phased Array Enhancements
     rotor_rpm_estimate: float = 18000.0        # Estimated rotor speed
     blade_count: int = 4                       # Quadrotor (4x2=8 blades)
     micro_doppler_spectrum_64: List[float] = field(default_factory=list) # 64-bin Doppler spectrum
@@ -38,7 +41,7 @@ class RadarContact:
 class RadarSensorSimulator:
     """
     3D Phased-Array Pulse-Doppler Tactical Radar Simulator.
-    Features 20 Hz track-while-scan update rate and micro-Doppler spectral physics.
+    Features 20 Hz track-while-scan update rate and CUDA-accelerated micro-Doppler STFT spectral physics.
     """
     def __init__(self, sweep_rate_hz: float = 2.0, max_range_m: float = 5000.0):
         self.sweep_rate = sweep_rate_hz
@@ -46,6 +49,7 @@ class RadarSensorSimulator:
         self.current_azimuth = 0.0
         self.last_update = time.time()
         self.next_contact_id = 201
+        self.cuda_engine = get_cuda_engine()
 
     def update_sweep(self) -> float:
         now = time.time()
@@ -62,9 +66,63 @@ class RadarSensorSimulator:
     ) -> List[float]:
         """
         Synthesizes a 64-bin micro-Doppler velocity spectrogram slice.
+        Uses CUDA PyTorch STFT when available:
+        s(t) = A_body * exp(j 2*pi*f_d*t) + sum(A_blade * cos(2*pi*f_r*t)*exp(j 2*pi*f_d*t)) + noise
         Quadrotors produce distinct symmetric sideband spikes (flashes) around the central body return.
         Birds produce asymmetric low-frequency bulk motion.
         """
+        if self.cuda_engine.is_cuda:
+            try:
+                device = self.cuda_engine.device
+                n_samples = 512
+                t = torch.linspace(0, 0.05, n_samples, device=device)  # 50 ms sample at 10 kHz
+                carrier_doppler = base_velocity_mps * 66.7  # X-band Doppler constant ~66.7 Hz per m/s
+
+                if is_bird:
+                    # Low frequency flapping (2-8 Hz)
+                    flap_freq = 6.0
+                    phase = 2.0 * math.pi * carrier_doppler * t + 0.8 * torch.sin(2.0 * math.pi * flap_freq * t)
+                    sig_real = torch.cos(phase) + torch.randn(n_samples, device=device) * 0.35
+                    sig_imag = torch.sin(phase) + torch.randn(n_samples, device=device) * 0.35
+                else:
+                    # Rotor blade tips high-frequency modulation
+                    f_blade = (rotor_rpm / 60.0) * 4.0  # Rotor blade passing frequency
+                    flash_mod = 0.65 * torch.cos(2.0 * math.pi * f_blade * t)
+                    phase = 2.0 * math.pi * carrier_doppler * t + flash_mod
+                    sig_real = torch.cos(phase) + torch.randn(n_samples, device=device) * 0.15
+                    sig_imag = torch.sin(phase) + torch.randn(n_samples, device=device) * 0.15
+
+                iq_signal = torch.complex(sig_real, sig_imag)
+                # Compute STFT
+                window = torch.hann_window(128, device=device)
+                stft_res = torch.stft(
+                    iq_signal,
+                    n_fft=128,
+                    hop_length=32,
+                    win_length=128,
+                    window=window,
+                    return_complex=True,
+                    center=True
+                )
+                spec_power = stft_res.abs().mean(dim=-1)  # Mean power across time frames
+                # Downsample/interpolate to 64 bins
+                spec_64 = torch.nn.functional.interpolate(
+                    spec_power.unsqueeze(0).unsqueeze(0),
+                    size=64,
+                    mode="linear",
+                    align_corners=False
+                ).squeeze().cpu().numpy()
+
+                # Convert to dB scale relative to peak
+                peak = max(float(spec_64.max()), 1e-6)
+                db_bins = 20.0 * np.log10(np.maximum(spec_64 / peak, 1e-3))
+                # Scale between -45 dBm and +15 dBm
+                scaled_bins = np.clip(db_bins + 15.0, -45.0, 18.0)
+                return [round(float(v), 1) for v in scaled_bins]
+            except Exception as e:
+                logger.debug(f"CUDA STFT failed, using fallback: {e}")
+
+        # NumPy CPU Fallback
         bins = np.random.normal(-45.0, 2.5, 64)
         center_bin = 32
 
@@ -111,7 +169,6 @@ class RadarSensorSimulator:
 
         if target_range_m is not None and target_azimuth_deg is not None:
             if target_range_m <= self.max_range_m:
-                # Phased-Array Electronic Steering covers target within beam cone
                 az_err = random.gauss(0.0, 0.4)
                 range_err = random.gauss(0.0, 2.5)
                 vel_mps = target_velocity_mps if target_velocity_mps is not None else random.uniform(14.0, 28.0)

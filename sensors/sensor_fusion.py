@@ -1,8 +1,10 @@
 """
-Multi-Modal Sensor Fusion Engine using Covariance Intersection & Log-Odds Bayesian Updating (v4.0-Lattice).
-Fuses asynchronous visual optronic tracks (EO/IR), 3D phased-array radar contacts, and RF SDR Angle-of-Arrival (AoA)
-into a unified Common Operating Picture (COP).
-Produces 3D ENU & geodetic Lat/Lon/Alt tactical tracks with sensor corroboration badges ([EO+RADAR+RF]).
+Multi-Modal Sensor Fusion Engine using Covariance Intersection & Log-Odds Bayesian Updating (v6.0-MONOLITH).
+Features:
+- Fuses asynchronous visual optronic tracks (EO/IR), 3D phased-array radar contacts, and RF SDR Angle-of-Arrival (AoA).
+- GPU-accelerated and CPU Covariance Intersection (CI) for unknown cross-correlations.
+- Produces 3D ENU & geodetic Lat/Lon/Alt tactical tracks with sensor corroboration badges ([EO+RADAR+RF]).
+- Supports friendly wingman and hostile multi-target deconfliction in unified Common Operating Picture (COP).
 """
 
 from dataclasses import dataclass, field
@@ -10,14 +12,17 @@ import math
 import time
 from typing import Dict, List, Optional, Tuple, Any
 import numpy as np
+import torch
 
 from utils.logger import get_logger
 from utils.geo_utils import forward_project
+from utils.cuda_runtime import get_cuda_engine
 from ai_core.detection import TrackedDrone
 from .rf_sensor import RFEmission
 from .radar_sensor import RadarContact
 
 logger = get_logger("CUAS.SensorFusion")
+
 
 @dataclass
 class FusedTacticalTrack:
@@ -33,7 +38,6 @@ class FusedTacticalTrack:
     radar_velocity_mps: Optional[float]
     last_update_time: float
     fusion_score: float                        # 0.0 to 1.0
-    # v4.0-Lattice 3D ENU & Geodetic Fusion
     position_3d_enu: Tuple[float, float, float] = (0.0, 0.0, 0.0) # (East, North, Up) meters
     latitude: float = 37.7749
     longitude: float = -122.4194
@@ -45,6 +49,8 @@ class FusedTacticalTrack:
     threat_score: float = 50.0
     time_to_impact_sec: Optional[float] = None
     wta_effector: str = "NONE"
+    is_friendly: bool = False
+    callsign: str = ""
 
 
 def covariance_intersection_1d(
@@ -65,6 +71,20 @@ def covariance_intersection_1d(
     return float(val_ci), float(var_ci)
 
 
+def batch_covariance_intersection_cuda(
+    vals_a: torch.Tensor, vars_a: torch.Tensor,
+    vals_b: torch.Tensor, vars_b: torch.Tensor,
+    omega: float = 0.5
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Vectorized Covariance Intersection on PyTorch GPU tensors."""
+    inv_a = 1.0 / torch.clamp(vars_a, min=1e-6)
+    inv_b = 1.0 / torch.clamp(vars_b, min=1e-6)
+    inv_ci = omega * inv_a + (1.0 - omega) * inv_b
+    var_ci = 1.0 / torch.clamp(inv_ci, min=1e-6)
+    val_ci = var_ci * (omega * inv_a * vals_a + (1.0 - omega) * inv_b * vals_b)
+    return val_ci, var_ci
+
+
 class SensorFusionHub:
     """
     Tactical Common Operating Picture (COP) Fusion Engine.
@@ -74,6 +94,7 @@ class SensorFusionHub:
         self.base_lat = base_latitude
         self.base_lon = base_longitude
         self.active_fused_tracks: Dict[int, FusedTacticalTrack] = {}
+        self.cuda_engine = get_cuda_engine()
 
     def fuse(
         self,
@@ -86,32 +107,28 @@ class SensorFusionHub:
         """Correlates detections across vision, RF, and radar streams using Covariance Intersection."""
         now = time.time()
         fused_results = []
-
-        # If no visual tracks exist but radar contacts do, instantiate radar-directed tracks
         all_track_sources = list(visual_tracks)
 
         for idx, v_track in enumerate(all_track_sources):
             fused_id = v_track.target_id
+            is_friendly = getattr(v_track, "is_friendly", False) or fused_id >= 500
+            callsign = getattr(v_track, "callsign", "") or (f"FRIENDLY-{fused_id}" if is_friendly else "")
 
-            # Associate RF emission (closest in bearing within 25 deg)
+            # Associate RF emission
             matched_rf = None
             if rf_emissions:
                 matched_rf = rf_emissions[idx % len(rf_emissions)]
 
-            # Associate Radar contact (closest in range/bearing)
+            # Associate Radar contact
             matched_radar = None
             if radar_contacts:
                 matched_radar = radar_contacts[idx % len(radar_contacts)]
 
             has_visual = True
-            has_rf = (matched_rf is not None and matched_rf.rssi_dbm > -98.0)
+            has_rf = (matched_rf is not None and matched_rf.rssi_dbm > -98.0) and not is_friendly
             has_radar = (matched_radar is not None and matched_radar.range_m > 10.0)
 
             # Covariance Intersection for Bearing & Distance
-            # Radar: high range accuracy (var 25 m^2), moderate azimuth (var 0.5 deg^2)
-            # Optical: high azimuth accuracy (var 0.2 deg^2), lower range accuracy (var 400 m^2)
-            # RF: coarse bearing (var 9.0 deg^2), coarse range (var 1600 m^2)
-
             bearing_est = default_bearing_deg
             bearing_var = 16.0
             dist_est = default_distance_m
@@ -143,10 +160,9 @@ class SensorFusionHub:
             if has_visual: badges.append("EO")
             if has_radar: badges.append("RADAR")
             if has_rf: badges.append("RF")
-            badge_str = f"[{'+'.join(badges)}]"
+            badge_str = f"[{'+'.join(badges)}]" if not is_friendly else "[BLUE-IFF]"
 
             # Log-Odds Bayesian Fusion Confidence
-            # L_fused = L_0 + sum(L_sensor)
             log_odds = math.log(max(0.05, v_track.confidence) / (1.0 - max(0.05, min(0.95, v_track.confidence))))
             if has_radar:
                 p_r = min(0.95, matched_radar.track_quality)
@@ -171,7 +187,7 @@ class SensorFusionHub:
                 confidence=fused_conf,
                 estimated_distance_m=round(dist_est, 1),
                 bearing_deg=round(bearing_est, 1),
-                classification_label=v_track.class_label,
+                classification_label=v_track.class_label if not is_friendly else "FRIENDLY_BLUE_FORCE",
                 rf_protocol=matched_rf.protocol if matched_rf else None,
                 radar_velocity_mps=round(vel_mps, 1),
                 last_update_time=now,
@@ -183,7 +199,9 @@ class SensorFusionHub:
                 velocity_3d_enu=(round(vel_e, 1), round(vel_n, 1), round(vel_u, 1)),
                 speed_mps=round(vel_mps, 1),
                 sensor_badge=badge_str,
-                imm_mode="CA_DIVE" if vel_mps > 22.0 else "CV"
+                imm_mode="CA_DIVE" if vel_mps > 22.0 else "CV",
+                is_friendly=is_friendly,
+                callsign=callsign
             )
             fused_results.append(track)
             self.active_fused_tracks[fused_id] = track

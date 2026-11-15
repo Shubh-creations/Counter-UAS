@@ -1,8 +1,10 @@
 """
-Multi-Drone Swarm Detection, Two-Stage ByteTrack Association, and Multi-Spectral EO/IR FLIR Generator (v4.0-Lattice).
-Supports Faster R-CNN and YOLOv8 with Hungarian IoU + Mahalanobis kinematic matching.
-Synthetic generator models simultaneous swarm scenarios (pincer saturation, low-altitude FPV skimmers, decoys)
-across Daylight Optical, FLIR White-Hot, and FLIR Black-Hot thermal modes.
+Multi-Drone Swarm Detection, Two-Stage ByteTrack Association, and Multi-Spectral EO/IR FLIR Generator (v6.0-MONOLITH).
+Features:
+- Batched GPU distance computation via PyTorch CUDA (torch.cdist) and FP16 autocast inference.
+- Two-Stage ByteTrack Hungarian IoU + Kinematic association.
+- Achromatic Monochrome Tactical Synthetic Generator supporting 12 simultaneous drones (hostile swarms + friendly wingmen).
+- Multi-spectral rendering: FLIR White-Hot, FLIR Black-Hot, SWIR Night Vision, and Achromatic EO Optical.
 """
 
 from dataclasses import dataclass, field
@@ -19,8 +21,10 @@ from torchvision import transforms
 from torchvision.models.detection import fasterrcnn_resnet50_fpn, FasterRCNN_ResNet50_FPN_Weights
 
 from utils.logger import get_logger
+from utils.cuda_runtime import get_cuda_engine
 
 logger = get_logger("CUAS.Detection")
+
 
 @dataclass
 class TrackedDrone:
@@ -36,6 +40,8 @@ class TrackedDrone:
     track_age_frames: int = 1
     consecutive_misses: int = 0
     state: str = "CONFIRMED"  # "TENTATIVE", "CONFIRMED", "LOST"
+    is_friendly: bool = False
+    callsign: str = ""
 
 
 def compute_iou(boxA: Tuple[int, int, int, int], boxB: Tuple[int, int, int, int]) -> float:
@@ -53,7 +59,7 @@ def compute_iou(boxA: Tuple[int, int, int, int], boxB: Tuple[int, int, int, int]
 
 
 class DroneDetector:
-    """Two-Stage ByteTrack + Hungarian Multi-Object Tracker."""
+    """Two-Stage ByteTrack + Hungarian Multi-Object Tracker with CUDA acceleration."""
     def __init__(
         self,
         model_type: str = "fasterrcnn",
@@ -62,9 +68,10 @@ class DroneDetector:
     ):
         self.model_type = model_type.lower()
         self.confidence_threshold = confidence_threshold
+        self.cuda_engine = get_cuda_engine()
 
         if device == "auto":
-            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            self.device = self.cuda_engine.device
         else:
             self.device = torch.device(device)
 
@@ -100,7 +107,7 @@ class DroneDetector:
             self.model.eval()
             if self.device.type == "cuda":
                 torch.backends.cudnn.benchmark = True
-            logger.info("Faster R-CNN ResNet-50 FPN initialized.")
+            logger.info("Faster R-CNN ResNet-50 FPN initialized with CUDA/CPU support.")
         except Exception as e:
             logger.error(f"Error initializing Faster R-CNN: {e}")
             raise
@@ -114,7 +121,7 @@ class DroneDetector:
         else:
             raw_detections = self._detect_fasterrcnn(frame_bgr)
 
-        # Apply Two-Stage ByteTrack Hungarian Association
+        # Apply Two-Stage ByteTrack Hungarian Association with CUDA cdist
         tracked = self._bytetrack_association(raw_detections, frame_bgr)
         return tracked
 
@@ -122,11 +129,12 @@ class DroneDetector:
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         tensor = self.transform(rgb).to(self.device)
 
-        with torch.no_grad():
-            predictions = self.model([tensor])[0]
+        enable_fp16 = (self.device.type == "cuda" and self.cuda_engine.supports_fp16)
+        with torch.autocast(device_type=self.device.type, dtype=torch.float16, enabled=enable_fp16):
+            with torch.no_grad():
+                predictions = self.model([tensor])[0]
 
         detections = []
-        # PyTorch CUDA safety: copy to CPU before numpy
         boxes = predictions["boxes"].detach().cpu().numpy()
         scores = predictions["scores"].detach().cpu().numpy()
 
@@ -165,7 +173,7 @@ class DroneDetector:
         frame_bgr: np.ndarray
     ) -> List[TrackedDrone]:
         """
-        Two-Stage ByteTrack Association using Hungarian Algorithm:
+        Two-Stage ByteTrack Association using Hungarian Algorithm with CUDA-accelerated distance metrics:
         Stage 1: Match high-confidence detections with existing confirmed tracks using IoU + Mahalanobis.
         Stage 2: Match remaining unassigned tracks with low-confidence detections to preserve tracks through occlusion/blur.
         """
@@ -179,28 +187,49 @@ class DroneDetector:
 
         # STAGE 1: Match High Detections
         if track_ids and high_dets:
-            cost_matrix = np.zeros((len(track_ids), len(high_dets)))
-            for i, tid in enumerate(track_ids):
+            # Prepare predicted centers and detection centers
+            pred_centers = []
+            pred_boxes = []
+            for tid in track_ids:
                 t = self.active_tracks[tid]
                 pred_x = t.center[0] + t.velocity_px[0]
                 pred_y = t.center[1] + t.velocity_px[1]
-                pred_box = (
+                pred_centers.append([pred_x, pred_y])
+                pred_boxes.append((
                     int(pred_x - (t.bbox[2] - t.bbox[0]) // 2),
                     int(pred_y - (t.bbox[3] - t.bbox[1]) // 2),
                     int(pred_x + (t.bbox[2] - t.bbox[0]) // 2),
                     int(pred_y + (t.bbox[3] - t.bbox[1]) // 2)
+                ))
+
+            det_centers = []
+            for det_box, _, _ in high_dets:
+                cx = (det_box[0] + det_box[2]) / 2.0
+                cy = (det_box[1] + det_box[3]) / 2.0
+                det_centers.append([cx, cy])
+
+            # Batched Distance computation via CUDA if available
+            try:
+                t_pred = torch.tensor(pred_centers, dtype=torch.float32, device=self.device)
+                t_det = torch.tensor(det_centers, dtype=torch.float32, device=self.device)
+                dist_matrix = torch.cdist(t_pred, t_det).cpu().numpy()
+            except Exception:
+                dist_matrix = np.linalg.norm(
+                    np.array(pred_centers)[:, None, :] - np.array(det_centers)[None, :, :],
+                    axis=2
                 )
 
-                for j, (det_box, _, _) in enumerate(high_dets):
-                    iou_val = compute_iou(pred_box, det_box)
-                    det_cx, det_cy = (det_box[0] + det_box[2]) / 2.0, (det_box[1] + det_box[3]) / 2.0
-                    euc_dist = math.hypot(det_cx - pred_x, det_cy - pred_y)
+            cost_matrix = np.zeros((len(track_ids), len(high_dets)), dtype=np.float32)
+            for i in range(len(track_ids)):
+                for j in range(len(high_dets)):
+                    iou_val = compute_iou(pred_boxes[i], high_dets[j][0])
+                    euc_dist = float(dist_matrix[i, j])
                     # Combined cost: 1 - IoU + normalized distance
                     cost_matrix[i, j] = (1.0 - iou_val) * 0.7 + min(1.0, euc_dist / 180.0) * 0.3
 
             row_ind, col_ind = linear_sum_assignment(cost_matrix)
             for r, c in zip(row_ind, col_ind):
-                if cost_matrix[r, c] < 0.85: # Gating threshold
+                if cost_matrix[r, c] < 0.85:  # Gating threshold
                     tid = track_ids[r]
                     bbox, score, label = high_dets[c]
                     self._update_existing_track(tid, bbox, score, label, frame_bgr, now)
@@ -210,7 +239,7 @@ class DroneDetector:
         # STAGE 2: Match Remaining Tracks with Low Detections
         unmatched_track_list = list(unmatched_tracks)
         if unmatched_track_list and low_dets:
-            cost_matrix_low = np.zeros((len(unmatched_track_list), len(low_dets)))
+            cost_matrix_low = np.zeros((len(unmatched_track_list), len(low_dets)), dtype=np.float32)
             for i, tid in enumerate(unmatched_track_list):
                 t = self.active_tracks[tid]
                 for j, (det_box, _, _) in enumerate(low_dets):
@@ -286,7 +315,7 @@ class DroneDetector:
 
 
 # =====================================================================
-# SYNTHETIC DRONE SWARM & MULTI-SPECTRAL EO/IR FLIR GENERATOR
+# SYNTHETIC DRONE SWARM & MULTI-SPECTRAL ACHROMATIC EO/IR GENERATOR
 # =====================================================================
 
 @dataclass
@@ -302,20 +331,24 @@ class SwarmDroneInstance:
     has_payload: bool
     temperature_k: float   # Hot spot temp (340K-410K)
     rotor_rpm: float       # 8,000 - 24,000 RPM
+    is_friendly: bool = False
+    callsign: str = ""
 
 
 class SyntheticDroneGenerator:
     """
-    Renders realistic synthetic multi-target swarms across:
-    1. EO Daylight (Optical RGB)
+    Renders realistic synthetic multi-target swarms across 100% Achromatic Modes:
+    1. EO Daylight (Optical Achromatic Grayscale)
     2. FLIR White-Hot Thermal
     3. FLIR Black-Hot Thermal
+    4. SWIR Night Vision (Achromatic phosphor)
+    Supports up to 12 simultaneous drones including hostile swarms and friendly interceptors/wingmen.
     """
     def __init__(self, width: int = 640, height: int = 480, scenario: str = "SWARM_SATURATION"):
         self.w = width
         self.h = height
         self.scenario = scenario
-        self.display_mode = "EO_DAYLIGHT"  # "EO_DAYLIGHT", "FLIR_WHITE_HOT", "FLIR_BLACK_HOT", "SWIR_NIGHT_VISION"
+        self.display_mode = "FLIR_WHITE_HOT"  # Default high-contrast monochrome thermal
         self.drones: List[SwarmDroneInstance] = []
         self._init_scenario()
 
@@ -330,10 +363,15 @@ class SyntheticDroneGenerator:
     def _init_scenario(self):
         self.drones.clear()
         if self.scenario == "FPV_TERMINAL_DIVE":
-            # Single high-speed terminal diving suicide drone
+            # Single high-speed terminal diving suicide drone + 1 friendly interceptor
             self.drones.append(SwarmDroneInstance(
                 id_num=101, x=320, y=110, z=280, vx=-1.2, vy=4.5, vz=-22.0,
                 drone_type="SUICIDE_FPV", has_payload=True, temperature_k=395.0, rotor_rpm=24000
+            ))
+            self.drones.append(SwarmDroneInstance(
+                id_num=501, x=310, y=390, z=50, vx=0.8, vy=-4.0, vz=18.0,
+                drone_type="FRIENDLY_INTERCEPTOR", has_payload=False, temperature_k=380.0, rotor_rpm=26000,
+                is_friendly=True, callsign="ANVIL-01"
             ))
         elif self.scenario == "RF_SILENT_STEALTH":
             # Autonomous optical navigation loitering munition with zero RF emissions
@@ -341,8 +379,13 @@ class SyntheticDroneGenerator:
                 id_num=102, x=220, y=140, z=180, vx=2.0, vy=1.8, vz=-8.0,
                 drone_type="AUTONOMOUS_LOITERING_MUNITION", has_payload=True, temperature_k=365.0, rotor_rpm=16000
             ))
+            self.drones.append(SwarmDroneInstance(
+                id_num=502, x=260, y=320, z=120, vx=-1.0, vy=-1.5, vz=5.0,
+                drone_type="FRIENDLY_WINGMAN", has_payload=False, temperature_k=350.0, rotor_rpm=18000,
+                is_friendly=True, callsign="ISR-WINGMAN-01"
+            ))
         elif self.scenario == "MIXED_AIRSPACE":
-            # 1 Hostile suicide drone + 1 civilian commercial drone
+            # 1 Hostile suicide drone + 1 civilian commercial drone + 1 friendly interceptor
             self.drones.append(SwarmDroneInstance(
                 id_num=101, x=200, y=120, z=220, vx=2.2, vy=2.8, vz=-14.0,
                 drone_type="SUICIDE_FPV", has_payload=True, temperature_k=390.0, rotor_rpm=22000
@@ -351,8 +394,13 @@ class SyntheticDroneGenerator:
                 id_num=104, x=450, y=200, z=110, vx=-1.4, vy=0.4, vz=-1.0,
                 drone_type="CIVILIAN_MULTIROTOR", has_payload=False, temperature_k=320.0, rotor_rpm=9500
             ))
+            self.drones.append(SwarmDroneInstance(
+                id_num=501, x=280, y=380, z=60, vx=-0.5, vy=-3.2, vz=14.0,
+                drone_type="FRIENDLY_INTERCEPTOR", has_payload=False, temperature_k=375.0, rotor_rpm=25000,
+                is_friendly=True, callsign="ANVIL-01"
+            ))
         else:
-            # Multi-Axis Swarm Saturation (8 simultaneous drones)
+            # Multi-Axis Swarm Saturation (up to 12 simultaneous drones: 8 hostile + 4 friendly wingmen/interceptors)
             self.drones.append(SwarmDroneInstance(101, 180, 130, 260, 2.0, 2.5, -16.0, "SUICIDE_FPV", True, 395.0, 24000))
             self.drones.append(SwarmDroneInstance(102, 460, 120, 290, -2.2, 2.2, -15.0, "SUICIDE_FPV", True, 390.0, 23500))
             self.drones.append(SwarmDroneInstance(103, 330, 80, 380, 0.6, 1.2, -6.0, "RECON_QUAD", False, 345.0, 14000))
@@ -361,34 +409,40 @@ class SyntheticDroneGenerator:
             self.drones.append(SwarmDroneInstance(106, 520, 160, 320, -1.6, 1.5, -9.0, "DECOY", False, 350.0, 15000))
             self.drones.append(SwarmDroneInstance(107, 280, 60, 420, 0.4, 0.8, -4.0, "RECON_QUAD", False, 330.0, 12000))
             self.drones.append(SwarmDroneInstance(108, 390, 210, 140, -0.8, 2.8, -18.0, "SUICIDE_FPV", True, 398.0, 24500))
+            # Friendly autonomous defenders
+            self.drones.append(SwarmDroneInstance(501, 200, 400, 70, 0.5, -3.5, 16.0, "FRIENDLY_INTERCEPTOR", False, 375.0, 25000, True, "ANVIL-01"))
+            self.drones.append(SwarmDroneInstance(502, 440, 390, 80, -0.6, -3.2, 15.0, "FRIENDLY_INTERCEPTOR", False, 370.0, 25000, True, "ANVIL-02"))
+            self.drones.append(SwarmDroneInstance(503, 300, 340, 160, 0.2, -1.0, 2.0, "FRIENDLY_WINGMAN", False, 340.0, 17000, True, "ISR-01"))
+            self.drones.append(SwarmDroneInstance(504, 360, 350, 150, -0.3, -1.1, 2.0, "FRIENDLY_WINGMAN", False, 340.0, 17000, True, "ISR-02"))
 
     def generate_frame(self) -> np.ndarray:
         frame = np.zeros((self.h, self.w, 3), dtype=np.uint8)
 
-        # 1. Background Generation (Sky + Horizon + Terrain)
+        # 1. Background Generation (Strict Achromatic Grayscale: #000000 to #FFFFFF)
         if self.display_mode == "EO_DAYLIGHT":
+            # Grayscale Daylight Horizon
             for y in range(self.h):
                 if y < int(self.h * 0.72):
                     ratio = y / (self.h * 0.72)
-                    b = int(45 + ratio * 35)
-                    g = int(35 + ratio * 30)
-                    r = int(25 + ratio * 25)
-                    frame[y, :] = (b, g, r)
+                    v = int(30 + ratio * 35)
+                    frame[y, :] = (v, v, v)
                 else:
                     t_ratio = (y - self.h * 0.72) / (self.h * 0.28)
-                    frame[y, :] = (int(18 + t_ratio * 12), int(28 + t_ratio * 16), int(14 + t_ratio * 10))
+                    v = int(20 + t_ratio * 15)
+                    frame[y, :] = (v, v, v)
         elif self.display_mode == "FLIR_WHITE_HOT":
+            # High-contrast thermal void
             for y in range(self.h):
-                val = int(18 + (y / self.h) * 22)
+                val = int(12 + (y / self.h) * 18)
                 frame[y, :] = (val, val, val)
         elif self.display_mode == "SWIR_NIGHT_VISION":
-            # Phosphor Emerald Night Vision
+            # Phosphor Achromatic High-Gain
             for y in range(self.h):
-                g = int(28 + (y / self.h) * 45)
-                frame[y, :] = (int(g * 0.2), g, int(g * 0.3))
-        else: # FLIR_BLACK_HOT
+                val = int(24 + (y / self.h) * 36)
+                frame[y, :] = (val, val, val)
+        else:  # FLIR_BLACK_HOT
             for y in range(self.h):
-                val = int(210 - (y / self.h) * 25)
+                val = int(220 - (y / self.h) * 24)
                 frame[y, :] = (val, val, val)
 
         # 2. Update and Render Multi-Drone Swarm
@@ -404,30 +458,48 @@ class SyntheticDroneGenerator:
                 drone.vy *= -1
 
             cx, cy = int(drone.x), int(drone.y)
-            # Distance scale (smaller if higher altitude)
             scale = max(0.5, min(1.8, 250.0 / max(60.0, drone.z)))
             arm_len = int(24 * scale)
 
-            # Render styling based on sensor mode
+            # Achromatic Styling
             if self.display_mode == "EO_DAYLIGHT":
                 body_color = (130, 130, 130)
                 arm_color = (70, 70, 70)
                 rotor_blur = (180, 180, 180)
                 payload_color = (40, 40, 40)
             elif self.display_mode == "FLIR_WHITE_HOT":
-                # Motors & batteries glow bright white/yellow
-                body_color = (245, 245, 245)
-                arm_color = (190, 190, 190)
-                rotor_blur = (220, 220, 220)
+                body_color = (255, 255, 255)
+                arm_color = (200, 200, 200)
+                rotor_blur = (230, 230, 230)
                 payload_color = (255, 255, 255)
-            else: # FLIR_BLACK_HOT
+            elif self.display_mode == "SWIR_NIGHT_VISION":
+                body_color = (240, 240, 240)
+                arm_color = (180, 180, 180)
+                rotor_blur = (210, 210, 210)
+                payload_color = (240, 240, 240)
+            else:  # FLIR_BLACK_HOT
                 body_color = (15, 15, 15)
                 arm_color = (40, 40, 40)
                 rotor_blur = (30, 30, 30)
                 payload_color = (5, 5, 5)
 
-            # Drone Central Body
-            cv2.circle(frame, (cx, cy), max(3, int(6 * scale)), body_color, -1)
+            # Friendly Asset Diamond Marker / Tag
+            if drone.is_friendly:
+                d_size = int(14 * scale)
+                pts = np.array([
+                    [cx, cy - d_size],
+                    [cx + d_size, cy],
+                    [cx, cy + d_size],
+                    [cx - d_size, cy]
+                ], dtype=np.int32)
+                f_color = (255, 255, 255) if self.display_mode != "FLIR_BLACK_HOT" else (10, 10, 10)
+                cv2.polylines(frame, [pts], isClosed=True, color=f_color, thickness=1)
+                # Label
+                cv2.putText(frame, drone.callsign, (cx - 20, cy - d_size - 4),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.32, f_color, 1, cv2.LINE_AA)
+            else:
+                # Hostile Drone Central Body
+                cv2.circle(frame, (cx, cy), max(3, int(6 * scale)), body_color, -1)
 
             # Carbon arms
             cv2.line(frame, (cx - arm_len, cy - int(arm_len * 0.5)), (cx + arm_len, cy + int(arm_len * 0.5)), arm_color, max(1, int(2 * scale)))
@@ -441,7 +513,6 @@ class SyntheticDroneGenerator:
                 (cx + arm_len, cy - int(arm_len * 0.5))
             ]:
                 cv2.ellipse(frame, (rx, ry), (int(10 * scale), int(3 * scale)), 0, 0, 360, rotor_blur, 1)
-                # Motor heat signature
                 cv2.circle(frame, (rx, ry), max(1, int(2 * scale)), body_color, -1)
 
             # Slung Munition Payload Silhouette
@@ -449,12 +520,12 @@ class SyntheticDroneGenerator:
                 p_len = int(10 * scale)
                 cv2.rectangle(frame, (cx - int(4 * scale), cy + int(4 * scale)), (cx + int(4 * scale), cy + int(4 * scale) + p_len), payload_color, -1)
 
-            # Thermal Blooming effect for FLIR
+            # Thermal Blooming effect for FLIR White-Hot
             if self.display_mode == "FLIR_WHITE_HOT":
-                cv2.circle(frame, (cx, cy), int(12 * scale), (255, 255, 200), 1)
+                cv2.circle(frame, (cx, cy), int(12 * scale), (255, 255, 255), 1)
 
-        # Micro-noise grain for realism
-        noise = np.random.randint(0, 5, (self.h, self.w, 3), dtype=np.uint8)
+        # Subtle micro-noise grain for sensor realism
+        noise = np.random.randint(0, 4, (self.h, self.w, 3), dtype=np.uint8)
         frame = cv2.add(frame, noise)
 
         return frame

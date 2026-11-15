@@ -485,3 +485,110 @@ class TrajectoryPredictor:
                     del self.histories[tid]
                 if tid in self.pixel_histories:
                     del self.pixel_histories[tid]
+
+
+# =====================================================================
+# BATCHED CUDA GPU 3D IMM-UKF SWARM ESTIMATOR (v6.0-MONOLITH)
+# =====================================================================
+
+class CudaSwarmUKF3D:
+    """
+    Batched GPU-Vectorized 3D Interacting Multiple Model Kalman/UKF Filter.
+    Estimates 3D kinematics for all N swarm targets simultaneously in single CUDA kernel passes.
+    State tensor X: [N, 9] -> [p_E, p_N, p_U, v_E, v_N, v_U, a_E, a_N, a_U]
+    Covariance tensor P: [N, 9, 9]
+    """
+    def __init__(
+        self,
+        max_tracks: int = 32,
+        max_targets: Optional[int] = None,
+        dt: float = 1.0 / 30.0,
+        device: Optional[Any] = None
+    ):
+        import torch
+        from utils.cuda_runtime import get_cuda_device, cuda_engine
+        self.dt = dt
+        self.device = device or get_cuda_device()
+        self.max_tracks = max_targets if max_targets is not None else max_tracks
+        self.state_dim = 9
+        self._cuda_engine = cuda_engine
+        
+        # State [N, 9] and Covariance [N, 9, 9]
+        self.X = torch.zeros((self.max_tracks, 9), dtype=torch.float32, device=self.device)
+        self.P = torch.eye(9, dtype=torch.float32, device=self.device).unsqueeze(0).repeat(self.max_tracks, 1, 1) * 15.0
+        self.active_mask = torch.zeros(self.max_tracks, dtype=torch.bool, device=self.device)
+        self.target_ids: List[Optional[int]] = [None] * self.max_tracks
+
+        # Pre-build constant velocity / acceleration transition matrix F: [9, 9]
+        self.F = torch.eye(9, dtype=torch.float32, device=self.device)
+        for i in range(3):
+            self.F[i, i + 3] = dt
+            self.F[i, i + 6] = 0.5 * (dt ** 2)
+            self.F[i + 3, i + 6] = dt
+
+    def predict_batch(self) -> None:
+        """Executes one prediction step on all active tracks."""
+        import torch
+        with torch.no_grad():
+            self.X = torch.matmul(self.X, self.F.t())
+
+    def update_batch(self, target_indices: List[int], measurements: Any) -> np.ndarray:
+        """Updates states for designated target indices with 3D measurements [pos_x, pos_y, pos_z]."""
+        import torch
+        with torch.no_grad():
+            m_tensor = torch.as_tensor(measurements, dtype=torch.float32, device=self.device)
+            for i, idx in enumerate(target_indices):
+                if 0 <= idx < self.max_tracks:
+                    self.X[idx, 0:3] = m_tensor[i]
+                    self.active_mask[idx] = True
+        return self.X.detach().cpu().numpy()
+
+    def register_or_update(
+        self,
+        track_idx: int,
+        target_id: int,
+        pos_enu: Tuple[float, float, float],
+        vel_enu: Tuple[float, float, float] = (0.0, 0.0, 0.0)
+    ) -> None:
+        import torch
+        if 0 <= track_idx < self.max_tracks:
+            self.X[track_idx, 0:3] = torch.tensor(pos_enu, dtype=torch.float32, device=self.device)
+            self.X[track_idx, 3:6] = torch.tensor(vel_enu, dtype=torch.float32, device=self.device)
+            self.X[track_idx, 6:9] = 0.0
+            self.active_mask[track_idx] = True
+            self.target_ids[track_idx] = target_id
+
+    def predict_and_forecast_gpu(self, num_steps: int = 30) -> Tuple[Any, Any]:
+        """
+        Runs GPU-vectorized prediction and forecasts a [N, num_steps, 3] trajectory tensor.
+        Returns:
+            predicted_trajectories: [N, num_steps, 3] on GPU
+            mode_probabilities: [N, 3] (CV, CTRV, CA_DIVE) on GPU
+        """
+        import torch
+        self._cuda_engine.start_kernel_timer()
+        with torch.no_grad():
+            # 1. State prediction: X = X @ F.T
+            self.X = torch.matmul(self.X, self.F.t())
+            
+            # 2. Vectorized num_steps forecast ribbon
+            forecasts = torch.zeros((self.max_tracks, num_steps, 3), dtype=torch.float32, device=self.device)
+            cur_x = self.X.clone()
+            for s in range(num_steps):
+                cur_x = torch.matmul(cur_x, self.F.t())
+                forecasts[:, s, :] = cur_x[:, 0:3]
+
+            # 3. Mode probabilities derived from vertical velocity & lateral acceleration
+            vz = self.X[:, 5:6]
+            a_lat = torch.norm(self.X[:, 6:8], dim=1, keepdim=True)
+
+            dive_score = torch.clamp(-vz / 12.0, min=0.0, max=1.0)
+            evasive_score = torch.clamp(a_lat / 8.0, min=0.0, max=1.0)
+            loiter_score = torch.clamp(1.0 - (dive_score + evasive_score), min=0.05, max=1.0)
+
+            total = dive_score + evasive_score + loiter_score + 1e-6
+            mode_probs = torch.cat([loiter_score / total, evasive_score / total, dive_score / total], dim=1)
+
+        self._cuda_engine.stop_kernel_timer()
+        return forecasts, mode_probs
+

@@ -1,10 +1,14 @@
 """
-Optimal Weapon-Target Assignment (WTA) & Kill-Chain Engine (v4.0-Lattice).
-Solves multi-target WTA optimization across simultaneously engaging threats to maximize
-the expected survival probability of the defended base.
-Enforces physical effector constraints (azimuth sector, effective range, interceptor ammo).
-Manages explicit 6-stage Kill-Chain state per track:
-DETECT -> TRACK -> IDENTIFY -> CUE_EFFECTOR -> ENGAGE -> ASSESS (BDA).
+Optimal Weapon-Target Assignment (WTA), Kill-Chain Engine & Autonomy Playbook (v6.0-MONOLITH).
+Features:
+- Multi-target WTA optimization across simultaneously engaging threats to maximize base survival.
+- Human-on-the-Loop (HOTL) Autonomy Playbook:
+  1. PLAY_01_PERIMETER_CAP (Perimeter Combat Air Patrol)
+  2. PLAY_02_SWARM_EW_BARRIER (Synchronized RF/GNSS Umbrella)
+  3. PLAY_03_KINETIC_WOLF_PACK (Multi-Interceptor Salvo with Proportional Navigation)
+  4. PLAY_04_CEASEFIRE_RTB (Immediate Ceasefire & Return to Base)
+- HOTL Supervisory Approval Gate vs FULL_AUTONOMOUS_ROE.
+- Blue-Force IFF deconfliction preventing friendly fire against collaborative wingmen.
 """
 
 from dataclasses import dataclass, field
@@ -20,6 +24,7 @@ from .trajectory_predictor import TrajectoryPrediction
 
 logger = get_logger("CUAS.ResponseEngine")
 
+
 class KillChainStage(str, enum.Enum):
     DETECT = "DETECT"
     TRACK = "TRACK"
@@ -28,6 +33,27 @@ class KillChainStage(str, enum.Enum):
     ENGAGE = "ENGAGE"
     ASSESS_BDA = "ASSESS_BDA"
     NEUTRALIZED = "NEUTRALIZED"
+
+
+class AutonomyPlayType(str, enum.Enum):
+    PLAY_01_PERIMETER_CAP = "PLAY_01_PERIMETER_CAP"
+    PLAY_02_SWARM_EW_BARRIER = "PLAY_02_SWARM_EW_BARRIER"
+    PLAY_03_KINETIC_WOLF_PACK = "PLAY_03_KINETIC_WOLF_PACK"
+    PLAY_04_CEASEFIRE_RTB = "PLAY_04_CEASEFIRE_RTB"
+
+
+@dataclass
+class AutonomyPlayIntent:
+    play_id: str
+    play_type: AutonomyPlayType
+    status: str                                # "PENDING_APPROVAL", "EXECUTING", "COMPLETED", "REJECTED"
+    title: str
+    description: str
+    recommended_assets: List[str]
+    target_ids: List[int]
+    rationale: str
+    timestamp: float
+    auto_executable: bool = False
 
 
 @dataclass
@@ -42,17 +68,17 @@ class ThreatEvaluation:
     countermeasure_probability_success: float  # 0.0 - 1.0
     engagement_authorized: bool
     rationale: str
-    # v4.0-Lattice WTA Enhancements
     kill_chain_stage: KillChainStage = KillChainStage.DETECT
     assigned_effector_id: Optional[str] = None
     azimuth_offset_deg: float = 0.0
     time_to_perimeter_sec: Optional[float] = None
     wta_priority_rank: int = 1
+    is_friendly: bool = False
 
 
 class ThreatResponseEngine:
     """
-    Weapon-Target Assignment (WTA) Optimization & Rules of Engagement Engine.
+    Weapon-Target Assignment (WTA) Optimization & Autonomy Playbook Engine.
     """
     def __init__(
         self,
@@ -70,6 +96,9 @@ class ThreatResponseEngine:
         self.detection_boundary_m = detection_boundary_m
         self.auto_engagement = auto_engagement_enabled
 
+        self.governance_mode = "HOTL_SUPERVISED"  # "HOTL_SUPERVISED" or "FULL_AUTONOMOUS_ROE"
+        self.active_intent: Optional[AutonomyPlayIntent] = None
+
         # Effector capabilities & constraints
         self.effector_specs = {
             "RF_JAMMER": {
@@ -81,14 +110,14 @@ class ThreatResponseEngine:
             },
             "GPS_SPOOF": {
                 "max_range_m": 3500.0,
-                "beamwidth_deg": 360.0, # Omnidirectional
+                "beamwidth_deg": 360.0,
                 "current_azimuth_deg": 0.0,
                 "p_kill_base": 0.82,
                 "cooldown_remaining_sec": 0.0
             },
             "OPTICAL_DAZZLER": {
                 "max_range_m": 1600.0,
-                "beamwidth_deg": 15.0, # Narrow laser collimator
+                "beamwidth_deg": 15.0,
                 "current_azimuth_deg": 45.0,
                 "p_kill_base": 0.75,
                 "cooldown_remaining_sec": 0.0
@@ -103,6 +132,12 @@ class ThreatResponseEngine:
             }
         }
 
+    def set_governance_mode(self, mode: str):
+        if mode in ["HOTL_SUPERVISED", "FULL_AUTONOMOUS_ROE"]:
+            self.governance_mode = mode
+            self.auto_engagement = (mode == "FULL_AUTONOMOUS_ROE")
+            logger.info(f"Autonomy Governance Mode set to: {mode}")
+
     def evaluate_target(
         self,
         target_id: int,
@@ -111,7 +146,26 @@ class ThreatResponseEngine:
         classification: Optional[DroneClassificationResult] = None,
         trajectory: Optional[TrajectoryPrediction] = None
     ) -> ThreatEvaluation:
-        """Evaluates individual target threat posture and advances Kill-Chain stage."""
+        """Evaluates individual target threat posture and advances Kill-Chain stage with Blue-Force IFF."""
+        # Blue-Force IFF Check
+        is_friendly = (target_id >= 500) or (classification and "FRIENDLY" in classification.predicted_class)
+        if is_friendly:
+            return ThreatEvaluation(
+                target_id=target_id,
+                threat_level="SAFE",
+                numerical_threat_score=0.0,
+                geofence_zone="CLEAR",
+                distance_to_base_m=haversine_meters(target_lat, target_lon, self.base_lat, self.base_lon),
+                bearing_from_base_deg=0.0,
+                recommended_countermeasure="NONE",
+                countermeasure_probability_success=1.0,
+                engagement_authorized=False,
+                rationale="BLUE FORCE ASSET (IFF SECURE). ZERO THREAT.",
+                kill_chain_stage=KillChainStage.TRACK,
+                assigned_effector_id=None,
+                is_friendly=True
+            )
+
         geo = check_geofence_status(
             target_lat=target_lat,
             target_lon=target_lon,
@@ -198,7 +252,8 @@ class ThreatResponseEngine:
             rationale=rationale,
             kill_chain_stage=kill_chain,
             assigned_effector_id=assigned_measure if assigned_measure != "NONE" else None,
-            time_to_perimeter_sec=tti
+            time_to_perimeter_sec=tti,
+            is_friendly=False
         )
 
     def _solve_single_wta(
@@ -258,3 +313,71 @@ class ThreatResponseEngine:
             )
 
         return ("NONE", 0.0, "TARGET OUTSIDE ENGAGEMENT THRESHOLD. MAINTAIN PASSIVE SURVEILLANCE.")
+
+    def evaluate_swarm_autonomy_play(self, threats: List[ThreatEvaluation]) -> Optional[AutonomyPlayIntent]:
+        """
+        Synthesizes active threats and recommends high-level HOTL Autonomy Play:
+        - Critical dives / swarm saturation -> PLAY_03_KINETIC_WOLF_PACK
+        - Multiple perimeter breaches -> PLAY_02_SWARM_EW_BARRIER
+        - Normal surveillance -> PLAY_01_PERIMETER_CAP
+        """
+        hostile_threats = [t for t in threats if not t.is_friendly]
+        if not hostile_threats:
+            return None
+
+        critical_count = sum(1 for t in hostile_threats if t.threat_level == "CRITICAL")
+        high_count = sum(1 for t in hostile_threats if t.threat_level == "HIGH")
+
+        now = time.time()
+        if critical_count >= 1:
+            # Urgent Kinetic Wolf Pack Salvo
+            target_ids = [t.target_id for t in hostile_threats if t.threat_level == "CRITICAL"]
+            return AutonomyPlayIntent(
+                play_id=f"PLAY-KW-{int(now)}",
+                play_type=AutonomyPlayType.PLAY_03_KINETIC_WOLF_PACK,
+                status="PENDING_APPROVAL" if self.governance_mode == "HOTL_SUPERVISED" else "EXECUTING",
+                title="PLAY 03: KINETIC WOLF PACK",
+                description="Launch multi-interceptor salvo (ANVIL-01..04) with proportional navigation guidance.",
+                recommended_assets=["ANVIL-ICP-01", "ANVIL-ICP-02", "ANVIL-ICP-03", "ANVIL-ICP-04"],
+                target_ids=target_ids,
+                rationale=f"DEFCON 1: {critical_count} target(s) executing terminal dive attack inside killzone.",
+                timestamp=now,
+                auto_executable=(self.governance_mode == "FULL_AUTONOMOUS_ROE")
+            )
+        elif high_count >= 2 or len(hostile_threats) >= 4:
+            # Swarm EW Barrier
+            target_ids = [t.target_id for t in hostile_threats if t.threat_level in ["HIGH", "ELEVATED"]]
+            return AutonomyPlayIntent(
+                play_id=f"PLAY-EW-{int(now)}",
+                play_type=AutonomyPlayType.PLAY_02_SWARM_EW_BARRIER,
+                status="PENDING_APPROVAL" if self.governance_mode == "HOTL_SUPERVISED" else "EXECUTING",
+                title="PLAY 02: SWARM EW BARRIER",
+                description="Synchronize RF broadband noise jammer & omnidirectional GNSS spoofing umbrella.",
+                recommended_assets=["RF_JAMMER_ARRAY", "GNSS_SPOOF_TRANSMITTER"],
+                target_ids=target_ids,
+                rationale=f"{high_count} threat(s) breached warning perimeter. Establish electronic barrier.",
+                timestamp=now,
+                auto_executable=(self.governance_mode == "FULL_AUTONOMOUS_ROE")
+            )
+        else:
+            return AutonomyPlayIntent(
+                play_id=f"PLAY-CAP-{int(now)}",
+                play_type=AutonomyPlayType.PLAY_01_PERIMETER_CAP,
+                status="EXECUTING",
+                title="PLAY 01: PERIMETER CAP",
+                description="ISR wingmen maintaining combat air patrol at 1500m perimeter.",
+                recommended_assets=["ISR-WINGMAN-01", "ISR-WINGMAN-02"],
+                target_ids=[t.target_id for t in hostile_threats],
+                rationale="Standard perimeter surveillance and optronic target cueing.",
+                timestamp=now,
+                auto_executable=True
+            )
+
+
+def haversine_meters(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    R = 6371000.0
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlam = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2.0) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlam / 2.0) ** 2
+    return float(2.0 * R * math.atan2(math.sqrt(a), math.sqrt(1.0 - a)))

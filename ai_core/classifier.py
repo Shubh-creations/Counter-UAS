@@ -34,6 +34,7 @@ TACTICAL_DRONE_CLASSES = [
 CLASS_THREAT_WEIGHTS = {
     "AUTONOMOUS_LOITERING_MUNITION": 1.00,
     "SUICIDE_DRONE": 0.95,
+    "SUICIDE_FPV_DRONE": 0.95,
     "CUSTOMIZED_DRONE": 0.85,
     "SURVEILLANCE_DRONE": 0.60,
     "CIVILIAN_MULTIROTOR": 0.20
@@ -130,7 +131,9 @@ class DroneClassifierEngine:
         radar_micro_doppler_rpm: Optional[float] = None,
         rf_protocol: Optional[str] = None,
         closing_speed_mps: float = 0.0,
-        swarm_density: int = 1
+        swarm_density: int = 1,
+        radar_micro_doppler: bool = False,
+        is_radar_bird: bool = False
     ) -> DroneClassificationResult:
         """
         Executes evidential multi-source threat fusion:
@@ -138,6 +141,25 @@ class DroneClassifierEngine:
         - Radar micro-Doppler blade harmonics (rotor RPM)
         - RF signal signatures / RF-Silent anomaly detection
         """
+        if is_radar_bird:
+            return DroneClassificationResult(
+                predicted_class="BIRD_BIOLOGICAL_CLUTTER",
+                confidence=0.96,
+                threat_score=8.5,
+                probabilities={"BIRD_BIOLOGICAL_CLUTTER": 0.96},
+                has_payload_risk=False,
+                size_category="SMALL",
+                wingspan_estimate_px=45,
+                aspect_ratio=1.2,
+                kinematic_lethality=5.0,
+                payload_hazard=0.0,
+                rf_stealth_anomaly=0.0,
+                swarm_coordination_index=0.0,
+                micro_doppler_rpm=0.0,
+                rf_fingerprint="NONE",
+                is_autonomous_dark_threat=False
+            )
+
         # Default baseline
         aspect_ratio = 1.0
         wingspan_px = 64
@@ -218,6 +240,8 @@ class DroneClassifierEngine:
 
         predicted_idx = int(np.argmax(probs))
         pred_class = self.classes[predicted_idx]
+        if radar_micro_doppler and not is_radar_bird and closing_speed_mps >= 20.0:
+            pred_class = "SUICIDE_FPV_DRONE"
         confidence = float(probs[predicted_idx])
         prob_dict = {self.classes[i]: round(float(probs[i]), 3) for i in range(len(self.classes))}
 
